@@ -7,20 +7,29 @@ module ActiveJob
     extend ActiveSupport::Concern
 
     included do
-      attr_accessor :batch_id
+      attr_accessor :batch_id, :bid
+
+      after_discard do |job, error|
+        # grab the workflow node and mark it as discarded?
+      end
     end
 
     def serialize
-      super.merge("batch_id" => batch_id)
+      super.merge("batch_id" => batch_id, "bid" => Thread.current[:sidekiq_batch]&.bid)
     end
 
     def deserialize(job_data)
       super
       self.batch_id = job_data["batch_id"]
+      self.bid = job_data["bid"]
     end
 
     def batch
       @batch ||= SolidQueue::JobBatch.find_by(id: batch_id)
+    end
+
+    def sidekiq_batch
+      @sidekiq_batch ||= Sidekiq::Batch.new(bid)
     end
   end
 end
