@@ -28,6 +28,7 @@ module Dummy
     # config.eager_load_paths << Rails.root.join("extras")
 
     config.active_job.queue_adapter = :solid_queue
+    # config.active_job.queue_adapter = :good_job
 
     if ENV["SEPARATE_CONNECTION"] && ENV["TARGET_DB"] != "sqlite"
       config.solid_queue.connects_to = { database: { writing: :primary, reading: :replica } }

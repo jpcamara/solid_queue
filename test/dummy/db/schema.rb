@@ -158,6 +158,46 @@ ActiveRecord::Schema[7.1].define(version: 2024_08_19_165045) do
     t.index ["key"], name: "index_solid_queue_semaphores_on_key", unique: true
   end
 
+  create_table "solid_queue_workflow_levels", charset: "utf8mb4", collation: "utf8mb4_0900_ai_ci", force: :cascade do |t|
+    t.bigint "workflow_id", null: false
+    t.string "workflow_level_id", null: false
+    t.string "parent_workflow_level_id"
+    t.datetime "started_at"
+    t.datetime "finished_at"
+    t.datetime "discarded_at"
+    t.datetime "created_at", null: false
+    t.datetime "updated_at", null: false
+    t.index ["discarded_at"], name: "index_solid_queue_workflow_levels_on_discarded_at"
+    t.index ["finished_at"], name: "index_solid_queue_workflow_levels_on_finished_at"
+    t.index ["started_at"], name: "index_solid_queue_workflow_levels_on_started_at"
+    t.index ["workflow_id"], name: "index_solid_queue_workflow_levels_on_workflow_id"
+    t.index ["workflow_level_id"], name: "index_solid_queue_workflow_levels_on_workflow_level_id", unique: true
+  end
+
+  create_table "solid_queue_workflow_nodes", charset: "utf8mb4", collation: "utf8mb4_0900_ai_ci", force: :cascade do |t|
+    t.bigint "workflow_id", null: false
+    t.string "active_job_id", null: false
+    t.text "active_job", null: false
+    t.string "workflow_level_id", null: false
+    t.string "parent_workflow_level_id"
+    t.datetime "started_at"
+    t.datetime "finished_at"
+    t.datetime "discarded_at"
+    t.datetime "created_at", null: false
+    t.datetime "updated_at", null: false
+    t.index ["discarded_at"], name: "index_solid_queue_workflow_nodes_on_discarded_at"
+    t.index ["finished_at"], name: "index_solid_queue_workflow_nodes_on_finished_at"
+    t.index ["started_at"], name: "index_solid_queue_workflow_nodes_on_started_at"
+    t.index ["workflow_id"], name: "index_solid_queue_workflow_nodes_on_workflow_id"
+  end
+
+  create_table "solid_queue_workflows", charset: "utf8mb4", collation: "utf8mb4_0900_ai_ci", force: :cascade do |t|
+    t.string "batch_id"
+    t.datetime "created_at", null: false
+    t.datetime "updated_at", null: false
+    t.index ["batch_id"], name: "index_solid_queue_workflows_on_batch_id"
+  end
+
   add_foreign_key "solid_queue_blocked_executions", "solid_queue_jobs", column: "job_id", on_delete: :cascade
   add_foreign_key "solid_queue_claimed_executions", "solid_queue_jobs", column: "job_id", on_delete: :cascade
   add_foreign_key "solid_queue_failed_executions", "solid_queue_jobs", column: "job_id", on_delete: :cascade
@@ -165,4 +205,6 @@ ActiveRecord::Schema[7.1].define(version: 2024_08_19_165045) do
   add_foreign_key "solid_queue_ready_executions", "solid_queue_jobs", column: "job_id", on_delete: :cascade
   add_foreign_key "solid_queue_recurring_executions", "solid_queue_jobs", column: "job_id", on_delete: :cascade
   add_foreign_key "solid_queue_scheduled_executions", "solid_queue_jobs", column: "job_id", on_delete: :cascade
+  add_foreign_key "solid_queue_workflow_levels", "solid_queue_workflows", column: "workflow_id"
+  add_foreign_key "solid_queue_workflow_nodes", "solid_queue_workflows", column: "workflow_id"
 end

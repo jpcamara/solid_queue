@@ -1,3 +1,6 @@
+SolidQueue::Supervisor.start(mode: :work)
+SolidQueue::Supervisor.start(mode: :dispatch)
+
 # Solid Queue
 
 Solid Queue is a DB-based queuing backend for [Active Job](https://edgeguides.rubyonrails.org/active_job_basics.html), designed with simplicity and performance in mind.
