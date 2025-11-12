@@ -3,29 +3,21 @@
 require "test_helper"
 
 class BatchLifecycleTest < ActiveSupport::TestCase
-  FailingJobError = Class.new(RuntimeError)
-
   setup do
-    @_on_thread_error = SolidQueue.on_thread_error
-    SolidQueue.on_thread_error = silent_on_thread_error_for([ FailingJobError ], @_on_thread_error)
     @worker = SolidQueue::Worker.new(queues: "background", threads: 3)
     @dispatcher = SolidQueue::Dispatcher.new(batch_size: 10, polling_interval: 0.2)
+
     SolidQueue::Batch.maintenance_queue_name = "background"
   end
 
   teardown do
-    SolidQueue.on_thread_error = @_on_thread_error
     @worker.stop
     @dispatcher.stop
 
-    JobBuffer.clear
-
-    SolidQueue::Job.destroy_all
-    SolidQueue::Batch.destroy_all
+    SolidQueue::Batch.maintenance_queue_name = nil
 
     ApplicationJob.enqueue_after_transaction_commit = false if defined?(ApplicationJob.enqueue_after_transaction_commit)
     SolidQueue.preserve_finished_jobs = true
-    SolidQueue::Batch.maintenance_queue_name = nil
   end
 
   class BatchOnSuccessJob < ApplicationJob
@@ -47,20 +39,20 @@ class BatchLifecycleTest < ActiveSupport::TestCase
   class FailingJob < ApplicationJob
     queue_as :background
 
-    retry_on FailingJobError, attempts: 3, wait: 0.1.seconds
+    retry_on ExpectedTestError, attempts: 3, wait: 0.1.seconds
 
     def perform
-      raise FailingJobError, "Failing job"
+      raise ExpectedTestError, "Failing job"
     end
   end
 
   class DiscardingJob < ApplicationJob
     queue_as :background
 
-    discard_on FailingJobError
+    discard_on ExpectedTestError
 
     def perform
-      raise FailingJobError, "Failing job"
+      raise ExpectedTestError, "Failing job"
     end
   end
 
@@ -75,6 +67,30 @@ class BatchLifecycleTest < ActiveSupport::TestCase
           AddToBufferJob.perform_later "added from inside 3"
         end
       end
+    end
+  end
+
+  class OnFinishJob < ApplicationJob
+    queue_as :background
+
+    def perform(batch)
+      JobBuffer.add "Hi finish #{batch.id}!"
+    end
+  end
+
+  class OnSuccessJob < ApplicationJob
+    queue_as :background
+
+    def perform(batch)
+      JobBuffer.add "Hi success #{batch.id}!"
+    end
+  end
+
+  class OnFailureJob < ApplicationJob
+    queue_as :background
+
+    def perform(batch)
+      JobBuffer.add "Hi failure #{batch.id}!"
     end
   end
 
@@ -115,9 +131,9 @@ class BatchLifecycleTest < ActiveSupport::TestCase
 
     assert_equal [ "added from inside 1", "added from inside 2", "added from inside 3", "hey", "ho" ], JobBuffer.values.sort
     assert_equal 3, SolidQueue::Batch.finished.count
-    assert_finished_in_order(job!(job3), batch2.reload)
+    assert_finished_in_order(job!(job3), batch2)
     assert_finished_in_order(job!(job2), batch2)
-    assert_finished_in_order(job!(job1), batch1.reload)
+    assert_finished_in_order(job!(job1), batch1)
   end
 
   test "when self.enqueue_after_transaction_commit = true" do
@@ -153,9 +169,9 @@ class BatchLifecycleTest < ActiveSupport::TestCase
     assert_equal 3, SolidQueue::Batch.finished.count
     assert_equal 3, jobs.finished.count
     assert_equal 3, jobs.count
-    assert_finished_in_order(job!(job3), batch3.reload)
-    assert_finished_in_order(job!(job2), batch2.reload)
-    assert_finished_in_order(job!(job1), batch1.reload)
+    assert_finished_in_order(job!(job3), batch3)
+    assert_finished_in_order(job!(job2), batch2)
+    assert_finished_in_order(job!(job1), batch1)
   end
 
   test "failed jobs fire properly" do
@@ -208,11 +224,14 @@ class BatchLifecycleTest < ActiveSupport::TestCase
     wait_for_batches_to_finish_for(5.seconds)
     wait_for_jobs_to_finish_for(5.second)
 
-    assert_equal 6, batch1.reload.jobs.count
+    batch1.reload
+    assert_equal 6, batch1.jobs.count
     assert_equal 6, batch1.total_jobs
     assert_equal 2, SolidQueue::Batch.finished.count
     assert_equal true, batch1.failed?
-    assert_equal 2, batch2.reload.jobs.count
+
+    batch2.reload
+    assert_equal 2, batch2.jobs.count
     assert_equal 2, batch2.total_jobs
     assert_equal true, batch2.succeeded?
   end
@@ -258,7 +277,7 @@ class BatchLifecycleTest < ActiveSupport::TestCase
       AddToBufferJob.perform_later "hey"
     end
 
-    assert_equal false, batch1.reload.finished?
+    assert_equal false, batch1.finished?
     assert_equal 1, batch1.jobs.count
     assert_equal 0, batch1.jobs.finished.count
 
@@ -268,7 +287,8 @@ class BatchLifecycleTest < ActiveSupport::TestCase
     wait_for_batches_to_finish_for(5.seconds)
     wait_for_jobs_to_finish_for(5.seconds)
 
-    assert_equal true, batch1.reload.finished?
+    batch1.reload
+    assert_equal true, batch1.finished?
     assert_equal 0, SolidQueue::Job.count
   end
 
@@ -288,48 +308,29 @@ class BatchLifecycleTest < ActiveSupport::TestCase
     wait_for_batches_to_finish_for(2.seconds)
     wait_for_jobs_to_finish_for(1.second)
 
+    batch.reload
     assert_equal [ "Hi finish #{batch.id}!", "Hi success #{batch.id}!", "hey" ].sort, JobBuffer.values.sort
-    assert_equal 1, batch.reload.completed_jobs
+    assert_equal 1, batch.completed_jobs
     assert_equal 0, batch.failed_jobs
     assert_equal 0, batch.pending_jobs
     assert_equal 1, batch.total_jobs
   end
 
-  class OnFinishJob < ApplicationJob
-    queue_as :background
-
-    def perform(batch)
-      JobBuffer.add "Hi finish #{batch.id}!"
-    end
-  end
-
-  class OnSuccessJob < ApplicationJob
-    queue_as :background
-
-    def perform(batch)
-      JobBuffer.add "Hi success #{batch.id}!"
-    end
-  end
-
-  class OnFailureJob < ApplicationJob
-    queue_as :background
-
-    def perform(batch)
-      JobBuffer.add "Hi failure #{batch.id}!"
-    end
-  end
-
   def assert_finished_in_order(*finishables)
     finishables.each_cons(2) do |finished1, finished2|
-      assert_equal finished1.finished_at < finished2.finished_at, true
+      assert_equal finished1.reload.finished_at < finished2.reload.finished_at, true
     end
   end
 
   def job!(active_job)
-    SolidQueue::Job.find_by!(active_job_id: active_job.job_id)
+    skip_active_record_query_cache do
+      SolidQueue::Job.find_by!(active_job_id: active_job.job_id)
+    end
   end
 
   def batch_jobs(*batches)
-    SolidQueue::Job.where(batch_id: batches.map(&:id))
+    skip_active_record_query_cache do
+      SolidQueue::Job.where(batch_id: batches.map(&:id))
+    end
   end
 end

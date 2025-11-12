@@ -46,6 +46,7 @@ class ActiveSupport::TestCase
 
     unless self.class.use_transactional_tests
       SolidQueue::Job.destroy_all
+      SolidQueue::Batch.destroy_all
       SolidQueue::Process.destroy_all
       SolidQueue::Semaphore.delete_all
       SolidQueue::RecurringTask.delete_all

@@ -1,11 +1,12 @@
 require "test_helper"
 
 class SolidQueue::BatchTest < ActiveSupport::TestCase
-  self.use_transactional_tests = false
+  class BatchCompletionJob < ApplicationJob
+    queue_as :background
 
-  teardown do
-    SolidQueue::Job.destroy_all
-    SolidQueue::Batch.destroy_all
+    def perform(batch)
+      Rails.logger.info "#{batch.jobs.size} jobs completed!"
+    end
   end
 
   class BatchWithArgumentsJob < ApplicationJob
