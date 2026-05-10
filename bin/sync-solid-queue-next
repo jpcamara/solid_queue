@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+# Rebuild this branch from upstream/main + the two integration PRs.
+#
+# Sources combined here:
+#   - rails/solid_queue main
+#   - rails/solid_queue PR #142 (job batches, jpcamara)
+#   - rails/solid_queue PR #728 (fiber/async worker pools, carmine)
+#
+# Usage:
+#   bin/sync-solid-queue-next            # rebuild current branch
+#   BRANCH=my-branch bin/sync-solid-queue-next
+#
+# The script is destructive: it runs `git reset --hard upstream/main` on the
+# target branch and re-cherry-picks every PR commit. Make sure your working
+# tree is clean and any local work on the target branch has been pushed.
+
+set -euo pipefail
+
+BRANCH="${BRANCH:-$(git rev-parse --abbrev-ref HEAD)}"
+UPSTREAM_REMOTE="${UPSTREAM_REMOTE:-upstream}"
+UPSTREAM_URL="${UPSTREAM_URL:-https://github.com/rails/solid_queue.git}"
+BATCH_PR="${BATCH_PR:-142}"
+FIBER_PR="${FIBER_PR:-728}"
+
+if ! git diff --quiet || ! git diff --cached --quiet; then
+  echo "error: working tree is dirty; commit or stash first" >&2
+  exit 1
+fi
+
+if ! git remote get-url "$UPSTREAM_REMOTE" >/dev/null 2>&1; then
+  git remote add "$UPSTREAM_REMOTE" "$UPSTREAM_URL"
+fi
+
+echo "==> Fetching $UPSTREAM_REMOTE main and PRs #$BATCH_PR, #$FIBER_PR"
+git fetch "$UPSTREAM_REMOTE" main
+git fetch "$UPSTREAM_REMOTE" "pull/${BATCH_PR}/head:pr-${BATCH_PR}-batch" --force
+git fetch "$UPSTREAM_REMOTE" "pull/${FIBER_PR}/head:pr-${FIBER_PR}-fiber" --force
+
+echo "==> Checking out $BRANCH and resetting to $UPSTREAM_REMOTE/main"
+git checkout "$BRANCH"
+git reset --hard "$UPSTREAM_REMOTE/main"
+
+cherry_pick_pr() {
+  local ref="$1" label="$2"
+  local commits
+  commits=$(git rev-list --reverse --no-merges "$UPSTREAM_REMOTE/main..$ref")
+  if [ -z "$commits" ]; then
+    echo "==> $label: nothing to cherry-pick"
+    return
+  fi
+  echo "==> Cherry-picking $label ($(echo "$commits" | wc -l | tr -d ' ') commits)"
+  echo "$commits" | xargs git cherry-pick
+}
+
+cherry_pick_pr "pr-${BATCH_PR}-batch" "PR #$BATCH_PR (batch)"
+cherry_pick_pr "pr-${FIBER_PR}-fiber" "PR #$FIBER_PR (fiber)"
+
+echo
+echo "Done. Branch '$BRANCH' is now $UPSTREAM_REMOTE/main + PR #$BATCH_PR + PR #$FIBER_PR."
+echo "Push with:  git push -u origin $BRANCH --force-with-lease"
