@@ -138,13 +138,13 @@ module SolidQueue
           # that uses INSERT ... RETURNING. Its internal_exec_query is gone on
           # Rails main.
           #
-          # Not a job with a concurrency limit that discards it on conflict, nor
-          # one whose class doesn't load, which skips its limits, nor one whose
-          # arguments the statement can't add its slot to.
+          # Not a job with a concurrency limit that discards it on conflict or
+          # caps its blocked jobs, nor one whose class doesn't load, which skips
+          # its limits, nor one whose arguments the statement can't add its slot to.
           def insertable_ready?(job, connection)
             !connection.preventing_writes? && connection.use_insert_returning? && connection.respond_to?(:internal_exec_query) &&
               job.due? &&
-              (!job.concurrency_limited? || (job.job_class.present? && !job.concurrency_on_conflict.discard? && slot_recordable_in_arguments?(job)))
+              (!job.concurrency_limited? || (job.job_class.present? && !job.concurrency_on_conflict.discard? && !job.concurrency_max_blocked && slot_recordable_in_arguments?(job)))
           end
 
           # The statement adds the slot's entry ahead of the serialized arguments'

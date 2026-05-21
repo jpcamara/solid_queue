@@ -18,10 +18,11 @@ module SolidQueue
         # as dispatching them one at a time would. Locks are taken in the order
         # the other enqueues take them: the set's batches first, then the
         # semaphores by key, so sets and single jobs enqueued at the same time
-        # don't deadlock. A set with a job that discards on conflict, with jobs
-        # on one key with different limits or durations, with a limit below 1,
-        # or with the same job twice, is dispatched one at a time, and a set
-        # without limited jobs is enqueued as in Base.
+        # don't deadlock. A set with a job that discards on conflict or caps
+        # its blocked jobs, with jobs on one key with different limits or
+        # durations, with a limit below 1, or with the same job twice, is
+        # dispatched one at a time, and a set without limited jobs is enqueued
+        # as in Base.
         def enqueue_all(active_jobs)
           return super unless active_jobs.any?(&:concurrency_limited?)
 
@@ -84,7 +85,7 @@ module SolidQueue
 
           def slots_takeable_for_all?(active_jobs, limited)
             active_jobs.map(&:job_id).uniq.size == active_jobs.size &&
-              limited.all? { |job, _| job.class.concurrency_on_conflict == :block && job.class.concurrency_limit.to_i >= 1 } &&
+              limited.all? { |job, _| job.class.concurrency_on_conflict == :block && job.class.concurrency_max_blocked.nil? && job.class.concurrency_limit.to_i >= 1 } &&
               limited.group_by { |_, attributes| attributes[:concurrency_key] }.values.all? { |pairs| pairs.map { |job, _| [ job.class.concurrency_limit, job.class.concurrency_duration ] }.uniq.one? }
           end
 
