@@ -61,6 +61,11 @@ module SolidQueue
         job_class ? job_class.concurrency_duration : SolidQueue.default_concurrency_control_period
       end
 
+      # The most jobs that can wait blocked on the job's key, or nil for no cap
+      def concurrency_max_blocked
+        job_class&.concurrency_max_blocked
+      end
+
       # The semaphore the job got its concurrency slot from
       def acquired_semaphore_id
         concurrency_lock&.dig("semaphore_id")
@@ -120,7 +125,18 @@ module SolidQueue
         end
 
         def block
-          BlockedExecution.create_or_find_by!(job: self)
+          return BlockedExecution.create_or_find_by!(job: self) unless concurrency_max_blocked
+
+          transaction do
+            # Lock the semaphore row to serialize concurrent enqueues racing to fill the cap.
+            Semaphore.lock.find_by(key: concurrency_key)
+
+            if BlockedExecution.where(concurrency_key: concurrency_key).count < concurrency_max_blocked
+              BlockedExecution.create_or_find_by!(job: self)
+            else
+              destroy
+            end
+          end
         end
 
         def execution
