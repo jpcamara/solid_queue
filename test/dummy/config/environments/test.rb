@@ -60,6 +60,10 @@ Rails.application.configure do
 
   config.solid_queue.shutdown_timeout = 2.seconds
 
+  # Keep job pickup snappy for latency-sensitive integration tests; cursor
+  # cadence behavior is pinned deterministically in ClaimCursorsTest
+  config.solid_queue.claim_cursors_discovery_interval = 0.05.seconds
+
   config.log_formatter = proc do |severity, timestamp, progname, msg|
     ts = timestamp.getlocal.strftime("%H:%M:%S.%3N")
     "#{ts} #{msg}\n"

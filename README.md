@@ -24,6 +24,7 @@ Solid Queue can be used with SQL databases such as MySQL, PostgreSQL, or SQLite,
   - [Database configuration](#database-configuration)
   - [Other configuration settings](#other-configuration-settings)
   - [Validating the configuration](#validating-the-configuration)
+- [Claim cursors on PostgreSQL](#claim-cursors-on-postgresql)
 - [Lifecycle hooks](#lifecycle-hooks)
 - [Errors when enqueuing](#errors-when-enqueuing)
 - [Concurrency controls](#concurrency-controls)
@@ -430,6 +431,79 @@ Both commands validate the configuration for the current Rails environment. On s
 
 `bin/jobs check` accepts the same options as `bin/jobs start` (e.g. `--config_file`, `--recurring_schedule_file`, `--skip-recurring`). The rake task honors the same environment variables Solid Queue already uses: `SOLID_QUEUE_CONFIG`, `SOLID_QUEUE_RECURRING_SCHEDULE`, and `SOLID_QUEUE_SKIP_RECURRING`. To validate a specific environment's configuration, set `RAILS_ENV`, for example `RAILS_ENV=production bin/jobs check`.
 
+
+## Claim cursors on PostgreSQL
+
+On PostgreSQL, long-running queries and transactions pin the xmin horizon: vacuum can't
+remove dead tuples from `solid_queue_ready_executions`, and because the claim query scans
+from the low end of the polling index -- exactly where claimed rows go to die -- every poll
+re-scans the accumulated graveyard, burning CPU proportionally to how long the horizon has
+been pinned.
+
+Claim cursors make polls graveyard-resistant: each process remembers one `(priority, id)`
+position per queue. Fast polls use that position for a single lexicographic index seek past
+dead tuples, across all priorities. When a seek comes up empty, the position is cleared and
+polls skip the claim query until discovery is due.
+
+The cursor is not a lower bound for live work. A competing claim of a lower id can roll
+back after this process advances past it, PostgreSQL sequences are not commit-ordered,
+so a row can allocate a lower id and commit late, and an empty seek under `SKIP LOCKED`
+can mean the remaining rows were merely locked by a peer at that instant. A cursor-free
+discovery query is therefore
+a fundamental part of finding work, not merely defensive healing. It runs on a time-based
+cadence (`config.solid_queue.claim_cursors_discovery_interval`, 1 second by default), seeds
+or heals the position, and discovers higher-priority arrivals below it. The interval bounds
+how long an idle worker takes to notice brand-new work, and how often it pays the graveyard
+scan: lower it for snappier pickup, raise it to spend even less CPU while a horizon is
+pinned.
+
+Discovery still scans the dead-tuple graveyard at that cadence, so cursors reduce and
+amortize the cost rather than eliminate it. Polling is graveyard-resistant, not
+dead-tuple-immune.
+
+This changes claim ordering within a priority from enqueue order (`job_id`) to the order
+jobs became ready (`id`): a scheduled job coming due now queues behind already-waiting jobs
+of the same priority instead of jumping ahead of them. Claims are ordered this way on every
+path, including when cursors are disabled, so the polling indexes need to lead with `id`.
+Existing installations add them alongside the current ones:
+
+```ruby
+class AddClaimCursorPollIndexes < ActiveRecord::Migration[8.0]
+  disable_ddl_transaction!
+
+  def change
+    add_index :solid_queue_ready_executions, [ :priority, :id ],
+      name: "index_solid_queue_poll_all_by_id", algorithm: :concurrently
+    add_index :solid_queue_ready_executions, [ :queue_name, :priority, :id ],
+      name: "index_solid_queue_poll_by_queue_and_id", algorithm: :concurrently
+  end
+end
+```
+
+Run this before deploying the upgrade: until the new indexes exist, claims fall back to
+sorting instead of an index scan. Keeping the old `job_id` indexes means either version of
+the gem has an index matching its ordering, so the upgrade and the migration can ship
+independently and a rollback needs no database change. New installs generate both index
+generations for the same reason, so a fresh schema matches a migrated one; the `job_id`
+pair will be dropped from the generated schema once the old ordering is retired. Note
+`CREATE INDEX CONCURRENTLY` waits for transactions older than itself, so a pinned horizon
+can delay it considerably.
+
+The old indexes are then unused, costing write throughput and space on the busiest table.
+Dropping them is optional cleanup, safe to defer, and worth confirming first:
+
+```sql
+SELECT indexrelname, idx_scan FROM pg_stat_user_indexes
+WHERE relname = 'solid_queue_ready_executions';
+```
+
+Once `idx_scan` stops advancing on the `job_id` indexes and every process runs the new
+version, `remove_index ..., algorithm: :concurrently` retires them.
+
+Cursors are enabled by default on PostgreSQL (`config.solid_queue.claim_cursors = false`
+to disable) and inactive on other databases, where the PostgreSQL vacuum pathology doesn't
+apply. Disabling cursors keeps the readiness ordering, so it is a kill switch for the
+cursor queries, not for the index requirement.
 
 ## Lifecycle hooks
 
