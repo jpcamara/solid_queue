@@ -448,18 +448,39 @@ polls skip the claim query until discovery is due.
 The cursor is not a lower bound for live work. A competing claim of a lower id can roll
 back after this process advances past it, PostgreSQL sequences are not commit-ordered,
 so a row can allocate a lower id and commit late, and an empty seek under `SKIP LOCKED`
-can mean the remaining rows were merely locked by a peer at that instant. A cursor-free
-discovery query is therefore
-a fundamental part of finding work, not merely defensive healing. It runs on a time-based
-cadence (`config.solid_queue.claim_cursors_discovery_interval`, 1 second by default), seeds
-or heals the position, and discovers higher-priority arrivals below it. The interval bounds
-how long an idle worker takes to notice brand-new work, and how often it pays the graveyard
-scan: lower it for snappier pickup, raise it to spend even less CPU while a horizon is
-pinned.
+can mean the remaining rows were merely locked by a peer at that instant. Discovery
+queries that don't use the cursor are therefore a fundamental part of finding work, not
+merely defensive healing, and they come in two forms.
 
-Discovery still scans the dead-tuple graveyard at that cadence, so cursors reduce and
-amortize the cost rather than eliminate it. Polling is graveyard-resistant, not
-dead-tuple-immune.
+A **floored** pass runs on the short cadence
+(`config.solid_queue.claim_cursors_discovery_interval`, 1 second by default). Its floor is
+the `solid_queue_ready_executions` sequence high-water mark, read just before the last
+unbounded pass: every row allocated since then has a greater id, at every priority, so
+`id > floor` finds strictly-higher-priority arrivals without rescanning the graveyard buried
+underneath them. The pass covers the region below the cursor and the fast seek covers the
+region above it, in the same poll, so claims keep their `(priority, id)` order. Because a
+floored pass only sees part of the index, it never advances the cursor -- it may only seed
+one that an empty seek cleared.
+
+An **unbounded** pass runs on the long cadence
+(`config.solid_queue.claim_cursors_full_discovery_interval`, 10 seconds by default). It
+scans the graveyard, records the next floor, and is the only pass that can reach a row
+sitting at or below the floor -- which happens only when a competing claim rolled back or a
+commit landed after the floor was read. It is also the only pass allowed to move the cursor
+anywhere.
+
+So the graveyard scan is paid once per full interval rather than once per second, and
+everything in between is bounded by how much work has been enqueued since. The tradeoff is
+that those two rare cases wait for the next unbounded pass -- at most the full interval (a
+per-process jitter only ever schedules it earlier) plus the short cadence it piggybacks on,
+instead of the short interval alone. Raise the interval to spend less CPU while a horizon is
+pinned, lower it to heal faster. Setting it to `0` makes every discovery pass unbounded.
+
+The floor's guarantee leans on ids being handed out in order, so it is only used when the
+id sequence's cache is `1` (PostgreSQL's default) on PostgreSQL 10 or newer, where the
+catalog exposes the cache setting. Anything else -- an older server, `CACHE` above 1, a
+table without its own sequence -- simply records no floor, and every discovery pass runs
+unbounded. Polling is graveyard-resistant, not dead-tuple-immune.
 
 This changes claim ordering within a priority from enqueue order (`job_id`) to the order
 jobs became ready (`id`): a scheduled job coming due now queues behind already-waiting jobs

@@ -9,13 +9,16 @@ class SolidQueue::ClaimCursorsTest < ActiveSupport::TestCase
     # The dummy app shortens the interval for integration latency; these tests
     # control discovery explicitly via expire_discovery!
     @original_discovery_interval = SolidQueue.claim_cursors_discovery_interval
+    @original_full_discovery_interval = SolidQueue.claim_cursors_full_discovery_interval
     SolidQueue.claim_cursors_discovery_interval = 10.minutes
+    SolidQueue.claim_cursors_full_discovery_interval = 10.minutes
   end
 
   teardown do
     SolidQueue::ReadyExecution.claim_cursors.reset!
     SolidQueue.claim_cursors = true
     SolidQueue.claim_cursors_discovery_interval = @original_discovery_interval if @original_discovery_interval
+    SolidQueue.claim_cursors_full_discovery_interval = @original_full_discovery_interval if @original_full_discovery_interval
   end
 
   test "advance is monotonic per key" do
@@ -157,6 +160,206 @@ class SolidQueue::ClaimCursorsTest < ActiveSupport::TestCase
     assert_equal [ immediate.job_id, scheduled.job_id ], claimed_jobs.map(&:active_job_id)
   end
 
+  test "discovery is unbounded until a pass has recorded a watermark" do
+    AddToBufferJob.perform_later("seed")
+
+    queries = capture_candidate_queries { assert_equal 1, claim(1).size }
+
+    assert_equal 1, queries.size
+    assert_not_includes queries.sole, "id > "
+    assert_not_nil cursors.floor("*")
+  end
+
+  test "a floored pass sweeps below the cursor and seeks above it in one poll" do
+    AddToBufferJob.perform_later("seed")
+    claim(1)
+
+    AddToBufferJob.perform_later("next")
+    cursors.expire_discovery!("*")
+
+    queries = capture_candidate_queries { assert_equal 1, claim(1).size }
+
+    assert_equal 2, queries.size
+    assert_includes queries.first, "(priority, id) <= ("
+    assert_includes queries.first, "id > "
+    assert_includes queries.second, "(priority, id) > ("
+  end
+
+  test "a floored pass finds a higher priority arrival without scanning below the watermark" do
+    AddToBufferJob.set(priority: 5).perform_later("seed")
+    claim(1)
+    position = cursors.position("*")
+
+    AddToBufferJob.set(priority: 1).perform_later("higher")
+    cursors.expire_discovery!("*")
+
+    queries = capture_candidate_queries do
+      claimed = claim(1)
+      assert_equal 1, SolidQueue::Job.find(claimed.sole.job_id).priority
+    end
+
+    assert_equal 1, queries.size
+    assert_includes queries.sole, "id > "
+    # A pass that only sees part of the index must not move the cursor: the rows
+    # its floor hid would fall below it and out of every other query
+    assert_equal position, cursors.position("*")
+  end
+
+  test "successive floored passes reach every arrival below the cursor" do
+    AddToBufferJob.set(priority: 9).perform_later("seed")
+    claim(1)
+
+    # The higher priority arrival takes the higher id, so a watermark that
+    # followed the claims would jump over the one left behind
+    lower = AddToBufferJob.set(priority: 5).perform_later("lower priority, lower id")
+    higher = AddToBufferJob.set(priority: 1).perform_later("higher priority, higher id")
+
+    cursors.expire_discovery!("*")
+    assert_equal higher.job_id, claimed_active_job_ids(1).sole
+
+    cursors.expire_discovery!("*")
+    assert_equal lower.job_id, claimed_active_job_ids(1).sole
+  end
+
+  test "a floored pass with no cursor spans every priority and seeds one" do
+    AddToBufferJob.set(priority: 5).perform_later("seed")
+    claim(1)
+    assert_empty claim(1)
+    assert_nil cursors.position("*")
+
+    AddToBufferJob.set(priority: 1).perform_later("higher")
+    cursors.expire_discovery!("*")
+
+    queries = capture_candidate_queries { assert_equal 1, claim(1).size }
+
+    assert_equal 1, queries.size
+    assert_includes queries.sole, "id > "
+    assert_not_includes queries.sole, "(priority, id) <= ("
+    assert_not_nil cursors.position("*")
+  end
+
+  test "a row below both the cursor and the watermark waits for the unbounded pass" do
+    AddToBufferJob.set(priority: 9).perform_later("seed")
+    claim(1)
+    seed_position = cursors.position("*")
+
+    AddToBufferJob.set(priority: 1).perform_later("stranded")
+    stranded = SolidQueue::ReadyExecution.sole
+
+    # What a rolled back claim or a commit landing after the watermark was read
+    # leaves behind: a row below the cursor that the floor also hides
+    cursors.record_full_discovery("*", seed_position, stranded.id)
+
+    cursors.expire_discovery!("*")
+    assert_empty claim(1)
+
+    cursors.expire_full_discovery!("*")
+    assert_equal 1, claim(1).size
+  end
+
+  test "the unbounded pass runs on its own cadence" do
+    AddToBufferJob.perform_later("seed")
+    claim(1)
+
+    assert_not cursors.discovery_due?("*")
+    assert_not cursors.full_discovery_due?("*")
+
+    cursors.expire_discovery!("*")
+    assert cursors.discovery_due?("*")
+    assert_not cursors.full_discovery_due?("*")
+
+    AddToBufferJob.perform_later("next")
+    cursors.expire_full_discovery!("*")
+    queries = capture_candidate_queries { assert_equal 1, claim(1).size }
+
+    assert_equal 1, queries.size
+    assert_not_includes queries.sole, "id > "
+    assert_not_includes queries.sole, "(priority, id)"
+  end
+
+  test "a zero full discovery interval keeps every discovery pass unbounded" do
+    SolidQueue.claim_cursors_full_discovery_interval = 0
+    AddToBufferJob.perform_later("seed")
+    claim(1)
+
+    AddToBufferJob.perform_later("next")
+    cursors.expire_discovery!("*")
+
+    queries = capture_candidate_queries { assert_equal 1, claim(1).size }
+
+    assert_equal 1, queries.size
+    assert_not_includes queries.sole, "id > "
+  end
+
+  test "a sequence cache above one records no floor and keeps discovery unbounded" do
+    with_sequence_cache(5) do
+      AddToBufferJob.perform_later("seed")
+      claim(1)
+      assert_nil cursors.floor("*")
+
+      AddToBufferJob.perform_later("next")
+      cursors.expire_discovery!("*")
+
+      queries = capture_candidate_queries { assert_equal 1, claim(1).size }
+      assert_not_includes queries.sole, "id > "
+    end
+  end
+
+  test "jitter only schedules the unbounded pass earlier, never later" do
+    now = 0.0
+    clocked = SolidQueue::ReadyExecution::ClaimCursors.new(clock: -> { now })
+
+    3.times do
+      clocked.record_full_discovery("*", [ 0, 1 ], 1)
+
+      now += 0.7 * SolidQueue.claim_cursors_full_discovery_interval
+      assert_not clocked.full_discovery_due?("*")
+
+      now += 0.3 * SolidQueue.claim_cursors_full_discovery_interval
+      assert clocked.full_discovery_due?("*")
+    end
+  end
+
+  test "cursor state is scoped to the datastore" do
+    cursors.advance("*", [ 0, 10 ])
+
+    # The pool is the datastore's identity: two datastores never share one
+    SolidQueue::ReadyExecution.stubs(:connection_pool).returns(Object.new)
+    other_cursors = SolidQueue::ReadyExecution.claim_cursors
+
+    assert_nil other_cursors.position("*")
+    other_cursors.advance("*", [ 0, 99 ])
+
+    SolidQueue::ReadyExecution.unstub(:connection_pool)
+    assert_equal [ 0, 10 ], cursors.position("*")
+  ensure
+    other_cursors&.reset!
+  end
+
+  test "a table without its own sequence records no floor instead of erroring" do
+    SolidQueue::ReadyExecution.stubs(:sequence_name).returns("nonexistent_sequence")
+    AddToBufferJob.perform_later("seed")
+
+    assert_equal 1, claim(1).size
+    assert_nil cursors.floor("*")
+  end
+
+  test "floored passes run with sort plans off and restore the setting" do
+    AddToBufferJob.perform_later("seed")
+    claim(1)
+
+    AddToBufferJob.perform_later("next")
+    cursors.expire_discovery!("*")
+
+    statements = capture_planner_settings { assert_equal 1, claim(1).size }
+
+    # On the graveyard's near-zero row estimates every plan ties, and the tie
+    # can land on a legacy job_id index that re-reads every dead tuple
+    assert_equal [ "SET LOCAL enable_sort = OFF", "SET LOCAL enable_sort = 'on'" ],
+      statements.grep(/enable_sort\b.*(OFF|on)/)
+    assert_equal "on", SolidQueue::Record.connection.select_value("SHOW enable_sort")
+  end
+
   test "disabling claim cursors uses the classic path without changing cursor state" do
     SolidQueue.claim_cursors = false
     AddToBufferJob.perform_later("classic")
@@ -180,6 +383,32 @@ class SolidQueue::ClaimCursorsTest < ActiveSupport::TestCase
 
     def position_of(execution)
       [ execution.priority, execution.id ]
+    end
+
+    def claimed_active_job_ids(limit)
+      claim(limit).map { |execution| SolidQueue::Job.find(execution.job_id).active_job_id }
+    end
+
+    def with_sequence_cache(cache)
+      connection = SolidQueue::Record.connection
+      sequence = connection.quote_table_name(SolidQueue::ReadyExecution.sequence_name)
+      connection.execute("ALTER SEQUENCE #{sequence} CACHE #{cache}")
+      yield
+    ensure
+      connection.execute("ALTER SEQUENCE #{sequence} CACHE 1")
+    end
+
+    def capture_planner_settings
+      statements = []
+      subscriber = ActiveSupport::Notifications.subscribe("sql.active_record") do |event|
+        sql = event.payload[:sql]
+        statements << sql if sql.start_with?("SET LOCAL enable_")
+      end
+
+      yield
+      statements
+    ensure
+      ActiveSupport::Notifications.unsubscribe(subscriber) if subscriber
     end
 
     def capture_candidate_queries

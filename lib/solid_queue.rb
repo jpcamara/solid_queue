@@ -28,6 +28,7 @@ module SolidQueue
   mattr_accessor :use_skip_locked, default: true
   mattr_accessor :claim_cursors, default: true
   mattr_accessor :claim_cursors_discovery_interval, default: 1.second
+  mattr_accessor :claim_cursors_full_discovery_interval, default: 10.seconds
 
   mattr_accessor :process_heartbeat_interval, default: 60.seconds
   mattr_accessor :process_alive_threshold, default: 5.minutes
