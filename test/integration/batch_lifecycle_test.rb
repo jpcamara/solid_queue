@@ -127,6 +127,42 @@ class BatchLifecycleTest < ActiveSupport::TestCase
     assert_finished_in_order(job!(job1), batch1.reload)
   end
 
+  test "a transaction that outlives the stalled window still enqueues its jobs" do
+    skip if Rails::VERSION::MAJOR == 7 && Rails::VERSION::MINOR == 1
+
+    ApplicationJob.enqueue_after_transaction_commit = true
+
+    batch = nil
+    job = nil
+    JobResult.transaction do
+      JobResult.create!(queue_name: "default", status: "")
+
+      batch = SolidQueue::Batch.enqueue(on_success: BatchOnSuccessJob.new("late")) do
+        job = AddToBufferJob.perform_later("late")
+      end
+
+      # The batch row commits before this transaction does, so another process's
+      # maintenance can reach it while the enqueues here are still pending
+      SolidQueue::Batch.where(id: batch.id).update_all(created_at: 10.minutes.ago)
+      SolidQueue::Batch.sweep_stalled
+
+      assert_not batch.reload.finished?
+    end
+
+    assert_equal batch.id, job!(job).batch_id
+    assert_equal 1, batch.reload.total_jobs
+    assert_not batch.finished?
+
+    @dispatcher.start
+    @worker.start
+
+    wait_for_batches_to_finish_for(5.seconds)
+    wait_for_jobs_to_finish_for(5.seconds)
+
+    assert batch.reload.finished?
+    assert_equal [ "late", "late: 1 jobs succeeded!" ].sort, JobBuffer.values.sort
+  end
+
   test "prebuilt jobs capture their batch before enqueue is deferred" do
     skip if Rails::VERSION::MAJOR == 7 && Rails::VERSION::MINOR == 1
 

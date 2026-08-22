@@ -473,6 +473,20 @@ class SolidQueue::BatchTest < ActiveSupport::TestCase
     assert_equal 3, batch.completed_jobs
   end
 
+  test "sweep_stalled leaves batches that don't have any jobs yet alone" do
+    # A batch filled from a transaction that outlives the stalled window: its row is
+    # already committed, but Active Job hasn't run the deferred enqueues yet
+    batch = SolidQueue::Batch.create!(on_success: BatchCompletionJob)
+    batch.update_columns(enqueued_at: nil, finished_at: nil, total_jobs: 0, created_at: 10.minutes.ago)
+    SolidQueue::Job.where(class_name: "BatchCompletionJob").delete_all
+
+    SolidQueue::Batch.sweep_stalled
+
+    assert_not batch.reload.finished?
+    assert_nil batch.enqueued_at
+    assert_empty SolidQueue::Job.where(class_name: "BatchCompletionJob")
+  end
+
   test "sweep_stalled starts batches whose creating process died before starting them" do
     batch = SolidQueue::Batch.enqueue { NiceJob.perform_later("world") }
 

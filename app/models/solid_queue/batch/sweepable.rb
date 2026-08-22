@@ -47,11 +47,19 @@ module SolidQueue
             finished
           end
 
-          # A batch that crashed between creation and start never got enqueued
+          # A batch that crashed between creation and start never got enqueued.
+          #
+          # Only batches that already have jobs qualify: a batch with none is
+          # indistinguishable from one still being filled, because the batch row
+          # commits before the jobs when they're enqueued from a transaction that
+          # outlives this window—Active Job defers those enqueues until it commits,
+          # and with a separate queue database the batch row doesn't wait for it.
+          # Starting one of those would finish it as completed, fire its callbacks,
+          # and leave the real enqueues to raise AlreadyFinished.
           def start_stalled_batches(stalled_for:, batch_size:)
             started = 0
 
-            unfinished.where(enqueued_at: nil).where(created_at: ...stalled_for.ago).find_each(batch_size: batch_size) do |batch|
+            unfinished.where(enqueued_at: nil).where(created_at: ...stalled_for.ago).where.not(total_jobs: 0).find_each(batch_size: batch_size) do |batch|
               started += 1
               batch.start
             end
