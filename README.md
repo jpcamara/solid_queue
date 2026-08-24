@@ -755,7 +755,7 @@ Callback jobs always enqueue through Solid Queue, even when the job classes invo
 
 ### Batch progress and counters
 
-Batches track `total_jobs`, `completed_jobs`, `failed_jobs` and `pending_jobs`, plus a `progress_percentage` helper. A couple of accounting details to be aware of:
+A batch's progress can be read through `total_jobs`, `completed_jobs`, `failed_jobs` and `pending_jobs`, plus a `progress_percentage` helper. These report on the batch rather than drive it—completion is detected from the batch's outstanding jobs, and most of the counters are computed when read. A couple of accounting details to be aware of:
 
 - Counters track *logical* jobs, matching what you enqueued: a retry via `retry_on` keeps the job's Active Job ID, so a job that fails twice and then succeeds still contributes 1 to `total_jobs`. Each attempt does get its own row in the batch's `jobs` relation, though.
 - Jobs discarded via `discard_on`, concurrency's `on_conflict: :discard`, or manual discarding count as completed, not failed.
