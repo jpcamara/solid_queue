@@ -693,7 +693,7 @@ The event is emitted in the process that performs the pruning (or the supervisor
 
 ## Batch jobs
 
-Solid Queue supports grouping jobs into batches, so you can track the progress of the set as a whole and optionally fire callbacks based on its status. Batches support the following:
+Solid Queue supports grouping jobs into batches, so you can track the progress of the set as a whole and optionally fire callbacks based on its status—for example, importing a file with one job per row, then sending a notification once every row has been processed. Batches support the following:
 
 - Relating jobs to a batch, to track their status
 - Three available callbacks to fire:
@@ -703,41 +703,41 @@ Solid Queue supports grouping jobs into batches, so you can track the progress o
 - Enqueuing more jobs for a batch from inside one of its jobs, with `batch.enqueue`
 - Attaching a description and arbitrary metadata to a batch
 
-Callback jobs are regular jobs: the batch doesn't pass them any arguments (although you can configure your own), and they can access the batch they belong to through the `batch` accessor:
+Callback jobs are regular jobs: they can access the batch they belong to through the `batch` accessor:
 
 ```ruby
-class SleepyJob < ApplicationJob
-  def perform(seconds_to_sleep)
-    Rails.logger.info "Feeling #{seconds_to_sleep} seconds sleepy..."
-    sleep seconds_to_sleep
+class ImportRowJob < ApplicationJob
+  def perform(row)
+    # ... import the row
   end
 end
 
-class BatchFinishJob < ApplicationJob
+class ImportFinishedJob < ApplicationJob
   def perform
-    Rails.logger.info "Finished all #{batch.total_jobs} jobs"
+    Rails.logger.info "Finished importing #{batch.total_jobs} rows"
   end
 end
 
-class BatchSuccessJob < ApplicationJob
+class ImportSucceededJob < ApplicationJob
   def perform
-    Rails.logger.info "All #{batch.completed_jobs} jobs worked!"
+    Rails.logger.info "All #{batch.completed_jobs} rows imported!"
   end
 end
 
-class BatchFailureJob < ApplicationJob
+class ImportFailedJob < ApplicationJob
   def perform
-    Rails.logger.info "#{batch.failed_jobs} jobs failed, sorry!"
+    Rails.logger.info "#{batch.failed_jobs} rows failed to import"
   end
 end
 
 SolidQueue::Batch.enqueue(
-  on_finish: BatchFinishJob,
-  on_success: BatchSuccessJob,
-  on_failure: BatchFailureJob,
+  description: "Nightly imports",
+  on_finish: ImportFinishedJob,
+  on_success: ImportSucceededJob,
+  on_failure: ImportFailedJob,
   user_id: 123
 ) do
-  5.times { |i| SleepyJob.perform_later(i) }
+  5.times { |i| ImportRowJob.perform_later(i) }
 end
 ```
 
@@ -749,13 +749,13 @@ A job joins the batch that's active *when its enqueue is requested*—this also 
 
 Besides the callbacks, `SolidQueue::Batch.enqueue` accepts a `description:`, to label the batch, and a `metadata:` hash; any other keyword arguments (like `user_id: 123` above) are merged into the batch's `metadata`.
 
-Callbacks can be given as a job class or as a configured job instance—for example, `on_finish: BatchFinishJob.new.set(queue: :batches)` or `on_success: BatchSuccessJob.new("some argument")`. Note that the job is serialized when the batch is created, so options resolved at that point (like `wait_until:` timestamps) are relative to batch creation, not to when the callback is eventually enqueued.
+Callbacks can be given as a job class or as a configured job instance—for example, `on_finish: ImportFinishedJob.new.set(queue: :batches)` or `on_success: ImportSucceededJob.new("some argument")`. Note that the job is serialized when the batch is created, so options resolved at that point (like `wait_until:` timestamps) are relative to batch creation, not to when the callback is eventually enqueued.
 
 Callback jobs always enqueue through Solid Queue, even when the job classes involved (or the application default) use a different Active Job adapter. And a batch that ends up with no jobs finishes as soon as it starts, firing its callbacks right away.
 
 ### Batch progress and counters
 
-Batches track `total_jobs`, `completed_jobs`, `failed_jobs` and `pending_jobs`, plus a `progress_percentage` helper. A couple of accounting details to be aware of:
+A batch's progress can be read through `total_jobs`, `completed_jobs`, `failed_jobs` and `pending_jobs`, plus a `progress_percentage` helper. These report on the batch rather than drive it—completion is detected from the batch's outstanding jobs, and most of the counters are computed when read. A couple of accounting details to be aware of:
 
 - Counters track *logical* jobs, matching what you enqueued: a retry via `retry_on` keeps the job's Active Job ID, so a job that fails twice and then succeeds still contributes 1 to `total_jobs`. Each attempt does get its own row in the batch's `jobs` relation, though.
 - Jobs discarded via `discard_on`, concurrency's `on_conflict: :discard`, or manual discarding count as completed, not failed.
@@ -785,7 +785,7 @@ clear_solid_queue_finished_batches:
 
 ### Upgrading existing installations
 
-If you installed Solid Queue before batches existed, copy the migration that adds the new tables to your app and run it:
+If you installed Solid Queue before version 1.7, batches need tables your database doesn't have yet. Copy the migration that adds them and run it:
 
 ```bash
 bin/rails solid_queue:update
