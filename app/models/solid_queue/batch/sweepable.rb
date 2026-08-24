@@ -2,20 +2,35 @@
 
 module SolidQueue
   class Batch
-    # Repairs batches that the regular completion detection can't finish on
-    # its own: jobs removed via bulk discards, processes that crashed after
-    # enqueueing jobs but before starting their batch, or completions whose
-    # callback enqueueing failed and rolled back.
+    # Repairs batches that the regular completion detection can't finish on its
+    # own: jobs removed via bulk discards, or completions whose callback
+    # enqueueing failed and rolled back.
+    #
+    # Repair here never invents state. A batch is only completed once its creator
+    # sealed it by calling #start, because "sealed" is the only thing that makes
+    # an empty batch meaningfully complete rather than merely unfilled. Batches
+    # that were never sealed are reported, not finished—see #report_stalled_batches.
     module Sweepable
       extend ActiveSupport::Concern
 
+      included do
+        scope :unsealed, -> { unfinished.where(enqueued_at: nil) }
+      end
+
       class_methods do
         def sweep_stalled(stalled_for: 5.minutes, batch_size: 500)
-          SolidQueue.instrument(:sweep_stalled_batches, stalled_for: stalled_for, stale_executions: 0, finished_batches: 0, started_batches: 0) do |payload|
+          SolidQueue.instrument(:sweep_stalled_batches, stalled_for: stalled_for, stale_executions: 0, finished_batches: 0, stalled_batches: 0) do |payload|
             payload[:stale_executions] = sweep_stale_executions(batch_size:)
             payload[:finished_batches] = finish_stalled_batches(batch_size:)
-            payload[:started_batches] = start_stalled_batches(stalled_for:, batch_size:)
+            payload[:stalled_batches] = report_stalled_batches(stalled_for:, batch_size:)
           end
+        end
+
+        # Batches their creator never sealed, and hasn't sealed for a while. Use
+        # this to find them, and SolidQueue::Batch#start to adopt one deliberately
+        # once you've established its creator is gone for good.
+        def stalled(stalled_for: 5.minutes)
+          unsealed.where(created_at: ...stalled_for.ago)
         end
 
         private
@@ -35,7 +50,9 @@ module SolidQueue
             swept
           end
 
-          # A started batch with no tracking rows left can finish
+          # A sealed batch with no tracking rows left can finish. Sealed is the
+          # load-bearing word: its creator got far enough to declare the batch
+          # complete, so an empty one really is done.
           def finish_stalled_batches(batch_size:)
             finished = 0
 
@@ -47,16 +64,29 @@ module SolidQueue
             finished
           end
 
-          # A batch that crashed between creation and start never got enqueued
-          def start_stalled_batches(stalled_for:, batch_size:)
-            started = 0
+          # An unsealed batch is one of two things, and nothing in the queue
+          # database tells them apart:
+          #
+          #   - its creator is still filling it, from a transaction that hasn't
+          #     committed yet. Active Job defers those enqueues until it does,
+          #     and with a separate queue database the batch row doesn't wait.
+          #   - its creator died before sealing it, and never will.
+          #
+          # Sealing the first kind loses work: the batch finishes as completed
+          # with whatever happened to have landed, fires its callbacks, and the
+          # real enqueues then raise AlreadyFinished. Since the two are
+          # indistinguishable, report them and let an operator decide, rather
+          # than guessing and reporting success for work that never ran.
+          def report_stalled_batches(stalled_for:, batch_size:)
+            stalled_batches = stalled(stalled_for: stalled_for)
+            count = stalled_batches.count
+            return 0 if count.zero?
 
-            unfinished.where(enqueued_at: nil).where(created_at: ...stalled_for.ago).find_each(batch_size: batch_size) do |batch|
-              started += 1
-              batch.start
+            stalled_batches.find_each(batch_size: batch_size) do |batch|
+              SolidQueue.instrument(:stalled_batch, batch_id: batch.id, created_at: batch.created_at, total_jobs: batch.total_jobs)
             end
 
-            started
+            count
           end
       end
     end

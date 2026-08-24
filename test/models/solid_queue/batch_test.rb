@@ -473,18 +473,68 @@ class SolidQueue::BatchTest < ActiveSupport::TestCase
     assert_equal 3, batch.completed_jobs
   end
 
-  test "sweep_stalled starts batches whose creating process died before starting them" do
-    batch = SolidQueue::Batch.enqueue { NiceJob.perform_later("world") }
+  test "sweep_stalled reports batches that were never sealed instead of completing them" do
+    batch = SolidQueue::Batch.enqueue(on_success: BatchCompletionJob) { NiceJob.perform_later("world") }
 
-    # Simulate a process that crashed after committing jobs but before start
+    # A batch whose creator never called start: either it died, or it's still
+    # filling the batch from a transaction that hasn't committed
     batch.update_columns(enqueued_at: nil, created_at: 10.minutes.ago)
     batch.jobs.sole.finished!
+    SolidQueue::Job.where(class_name: "BatchCompletionJob").delete_all
+
+    events = []
+    callback = ->(*args) { events << ActiveSupport::Notifications::Event.new(*args) }
+    ActiveSupport::Notifications.subscribed(callback, "stalled_batch.solid_queue") do
+      SolidQueue::Batch.sweep_stalled
+    end
 
     assert_not batch.reload.finished?
+    assert_nil batch.enqueued_at
+    assert_empty SolidQueue::Job.where(class_name: "BatchCompletionJob")
+
+    assert_equal 1, events.size
+    assert_equal batch.id, events.sole.payload[:batch_id]
+  end
+
+  test "sweep_stalled counts stalled batches in its payload" do
+    batch = SolidQueue::Batch.enqueue { NiceJob.perform_later("world") }
+    batch.update_columns(enqueued_at: nil, created_at: 10.minutes.ago)
+
+    payload = nil
+    callback = ->(*args) { payload = ActiveSupport::Notifications::Event.new(*args).payload }
+    ActiveSupport::Notifications.subscribed(callback, "sweep_stalled_batches.solid_queue") do
+      SolidQueue::Batch.sweep_stalled
+    end
+
+    assert_equal 1, payload[:stalled_batches]
+  end
+
+  test "stalled finds unsealed batches and start adopts one deliberately" do
+    batch = SolidQueue::Batch.enqueue(on_success: BatchCompletionJob) { NiceJob.perform_later("world") }
+    batch.update_columns(enqueued_at: nil, created_at: 10.minutes.ago)
+    batch.jobs.sole.finished!
+    SolidQueue::Job.where(class_name: "BatchCompletionJob").delete_all
+
+    assert_equal [ batch ], SolidQueue::Batch.stalled.to_a
+
+    batch.start
+
+    assert batch.reload.finished?
+    assert_equal 1, SolidQueue::Job.where(class_name: "BatchCompletionJob").count
+  end
+
+  test "sweep_stalled still finishes sealed batches with no tracking rows left" do
+    batch = SolidQueue::Batch.enqueue(on_success: BatchCompletionJob) { NiceJob.perform_later("world") }
+    SolidQueue::Job.where(class_name: "BatchCompletionJob").delete_all
+
+    # Sealed by its creator, but its tracking row was removed without callbacks
+    assert batch.reload.enqueued?
+    batch.batch_executions.delete_all
 
     SolidQueue::Batch.sweep_stalled
 
     assert batch.reload.finished?
+    assert_equal 1, SolidQueue::Job.where(class_name: "BatchCompletionJob").count
   end
 
   test "conflict-discarded jobs count the same for single and bulk enqueues" do

@@ -34,6 +34,7 @@ Solid Queue can be used with SQL databases such as MySQL, PostgreSQL, or SQLite,
 - [Batch jobs](#batch-jobs)
   - [Batch progress and counters](#batch-progress-and-counters)
   - [Batch maintenance](#batch-maintenance)
+    - [Stalled batches](#stalled-batches)
   - [Clearing batches](#clearing-batches)
   - [Upgrading existing installations](#upgrading-existing-installations)
 - [Puma plugin](#puma-plugin)
@@ -763,7 +764,7 @@ Batches track `total_jobs`, `completed_jobs`, `failed_jobs` and `pending_jobs`, 
 
 ### Batch maintenance
 
-Batch completion is normally detected as jobs finish, without ever locking the batch row outside a single once-per-batch moment. A few edge cases can't trigger that detection: jobs removed via bulk discards (which delete jobs without callbacks), a process that crashed after enqueueing jobs but before starting its batch, or a completion whose callback enqueueing failed and rolled back.
+Batch completion is normally detected as jobs finish, without ever locking the batch row outside a single once-per-batch moment. A couple of edge cases can't trigger that detection: jobs removed via bulk discards (which delete jobs without callbacks), or a completion whose callback enqueueing failed and rolled back.
 
 The dispatcher sweeps these up automatically via `SolidQueue::Batch.sweep_stalled`, as part of its regular maintenance (every `concurrency_maintenance_interval` seconds, sharing a single maintenance timer and database connection). If you disable `batch_maintenance` (or don't run a dispatcher), you can run the sweep yourself, for example as a [recurring task](#recurring-tasks):
 
@@ -772,6 +773,26 @@ batch_maintenance:
   command: "SolidQueue::Batch.sweep_stalled"
   schedule: every 5 minutes
 ```
+
+#### Stalled batches
+
+Maintenance only completes batches their creator *sealed*—batches `SolidQueue::Batch.enqueue` finished filling. A batch that was never sealed is reported rather than completed, because nothing in the queue database distinguishes the two reasons it might be unsealed:
+
+- its creator is still filling it, from a transaction that hasn't committed yet. Active Job defers those enqueues until it does, and with a separate queue database the batch row doesn't wait for them.
+- its creator died before sealing it, and never will.
+
+Completing the first kind loses work: the batch finishes with whatever happened to have landed, fires its callbacks, and the real enqueues then raise `SolidQueue::Batch::AlreadyFinished`. Rather than guess, the sweep emits a `stalled_batch.solid_queue` event for each one and leaves it alone.
+
+To find them, and to adopt one once you've established its creator is gone for good:
+
+```ruby
+SolidQueue::Batch.stalled                          # unsealed for more than 5 minutes
+SolidQueue::Batch.stalled(stalled_for: 1.hour)
+
+SolidQueue::Batch.stalled.find_each(&:start)       # seal and complete them yourself
+```
+
+Jobs already in a stalled batch run normally—only the batch's own completion waits.
 
 ### Clearing batches
 
