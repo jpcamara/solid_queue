@@ -785,7 +785,7 @@ clear_solid_queue_finished_batches:
 
 ### Upgrading existing installations
 
-If you installed Solid Queue before version 1.7, copy the migration that adds the tables batches use to your app and run it:
+If you installed Solid Queue before version 1.7, batches need tables your database doesn't have yet. Copy the migration that adds them and run it:
 
 ```bash
 bin/rails solid_queue:update
