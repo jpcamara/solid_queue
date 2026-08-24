@@ -487,6 +487,89 @@ class SolidQueue::BatchTest < ActiveSupport::TestCase
     assert batch.reload.finished?
   end
 
+  test "a batch created in a transaction that rolls back is discarded with its jobs" do
+    skip "Rails 7.1 has no transaction rollback hooks" unless ActiveRecord.respond_to?(:all_open_transactions)
+
+    batch = nil
+
+    JobResult.transaction do
+      JobResult.create!(queue_name: "default", status: "")
+      batch = SolidQueue::Batch.enqueue(on_success: BatchCompletionJob) { NiceJob.perform_later("world") }
+      raise ActiveRecord::Rollback
+    end
+
+    assert_nil SolidQueue::Batch.find_by(id: batch.id)
+    assert_empty SolidQueue::Job.where(batch_id: batch.id)
+    assert_empty SolidQueue::Job.where(class_name: NiceJob.name)
+  end
+
+  test "a batch with no jobs yet is discarded when its transaction rolls back" do
+    skip "Rails 7.1 has no transaction rollback hooks" unless ActiveRecord.respond_to?(:all_open_transactions)
+
+    batch = nil
+
+    JobResult.transaction do
+      JobResult.create!(queue_name: "default", status: "")
+      batch = SolidQueue::Batch.enqueue(on_success: BatchCompletionJob) { }
+      raise ActiveRecord::Rollback
+    end
+
+    assert_nil SolidQueue::Batch.find_by(id: batch.id)
+  end
+
+  test "a batch created in a rolled-back savepoint is discarded" do
+    skip "Rails 7.1 has no transaction rollback hooks" unless ActiveRecord.respond_to?(:all_open_transactions)
+
+    batch = nil
+
+    JobResult.transaction do
+      JobResult.create!(queue_name: "default", status: "")
+
+      JobResult.transaction(requires_new: true) do
+        batch = SolidQueue::Batch.enqueue { NiceJob.perform_later("world") }
+        raise ActiveRecord::Rollback
+      end
+    end
+
+    assert_nil SolidQueue::Batch.find_by(id: batch.id)
+    assert_empty SolidQueue::Job.where(class_name: NiceJob.name)
+  end
+
+  test "a batch created in a transaction that commits is left alone" do
+    skip "Rails 7.1 has no transaction rollback hooks" unless ActiveRecord.respond_to?(:all_open_transactions)
+
+    batch = nil
+
+    JobResult.transaction do
+      JobResult.create!(queue_name: "default", status: "")
+      batch = SolidQueue::Batch.enqueue { NiceJob.perform_later("world") }
+    end
+
+    assert batch.reload.enqueued?
+    assert_equal 1, batch.total_jobs
+    assert_equal 1, SolidQueue::Job.where(batch_id: batch.id).count
+  end
+
+  test "a rolled-back batch leaves jobs a worker already claimed alone" do
+    skip "Rails 7.1 has no transaction rollback hooks" unless ActiveRecord.respond_to?(:all_open_transactions)
+
+    batch = nil
+    claimed = nil
+
+    JobResult.transaction do
+      JobResult.create!(queue_name: "default", status: "")
+      batch = SolidQueue::Batch.enqueue { NiceJob.perform_later("world") }
+      claimed = SolidQueue::ReadyExecution.claim("*", 1, 42)
+      raise ActiveRecord::Rollback
+    end
+
+    # Configurations that defer enqueues have no job to claim inside the transaction
+    skip "enqueues are deferred here, so there was nothing to claim" if claimed.empty?
+
+    assert_nil SolidQueue::Batch.find_by(id: batch.id)
+    assert_equal 1, SolidQueue::Job.where(class_name: NiceJob.name).count
+  end
+
   test "conflict-discarded jobs count the same for single and bulk enqueues" do
     result1 = JobResult.create!(queue_name: "default", status: "")
     batch1 = SolidQueue::Batch.enqueue do
