@@ -31,7 +31,11 @@ module SolidQueue
         # is. Asking the cheap question first means the batch row is only read
         # for the job that actually finishes the batch. #finish asks it again, so
         # this decides nothing on its own.
-        return if where(batch_id: batch_id).exists?
+        #
+        # Looking from the newest row backwards, because a batch drains roughly
+        # in id order: the rows still outstanding are the ones at the end, while
+        # the beginning of the range is whatever the finished jobs left behind.
+        return if where(batch_id: batch_id).order(id: :desc).pick(:id)
 
         # Skip the serialized callback and metadata columns on this hot path
         if batch = Batch.select(:id, :finished_at, :enqueued_at).find_by(id: batch_id)
