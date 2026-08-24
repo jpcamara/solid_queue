@@ -11,6 +11,7 @@ module SolidQueue
 
         after_create :create_batch_execution, if: :batched?
         after_update :update_batch_progress, if: :batched?
+        after_commit :finish_batch_after_progress, on: :update
         before_destroy :destroy_batch_execution, if: :batched?
       end
 
@@ -31,10 +32,23 @@ module SolidQueue
           BatchExecution.create_all_from_jobs([ self ])
         end
 
+        # The tracking row is deleted by key rather than loaded and destroyed:
+        # a finishing job already knows which row is its own. Completion is then
+        # checked from this job's own after_commit, which runs at the same point
+        # the tracking row's would have.
         def update_batch_progress
           return unless saved_change_to_finished_at? && finished_at.present?
 
-          batch_execution&.destroy!
+          @batch_execution_removed = BatchExecution.where(job_id: id).delete_all.positive?
+        rescue ActiveRecord::ActiveRecordError => e
+          SolidQueue.instrument(:batch_progress_error, batch_id: batch_id, job_id: id, error: e)
+        end
+
+        def finish_batch_after_progress
+          return unless @batch_execution_removed
+
+          @batch_execution_removed = false
+          BatchExecution.finish_batch_for(batch_id)
         rescue ActiveRecord::ActiveRecordError => e
           SolidQueue.instrument(:batch_progress_error, batch_id: batch_id, job_id: id, error: e)
         end

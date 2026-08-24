@@ -24,6 +24,21 @@ module SolidQueue
         end
       end
 
+      # Shared by the tracking row's own destroy callback and by a finishing
+      # job, which deletes its row by key and checks from its own after_commit.
+      def finish_batch_for(batch_id)
+        # Every finishing job asks whether it was the last one, and almost never
+        # is. Asking the cheap question first means the batch row is only read
+        # for the job that actually finishes the batch. #finish asks it again, so
+        # this decides nothing on its own.
+        return if where(batch_id: batch_id).exists?
+
+        # Skip the serialized callback and metadata columns on this hot path
+        if batch = Batch.select(:id, :finished_at, :enqueued_at).find_by(id: batch_id)
+          batch.finish
+        end
+      end
+
       private
         def attempt_to_update_total_jobs(batch_id, jobs)
           new_jobs_count = count_new_jobs_among(jobs)
@@ -43,16 +58,7 @@ module SolidQueue
 
     private
       def finish_batch
-        # Every finishing job asks whether it was the last one, and almost never
-        # is. Asking the cheap question first means the batch row is only read
-        # for the job that actually finishes the batch. #finish asks it again, so
-        # this decides nothing on its own.
-        return if self.class.where(batch_id: batch_id).exists?
-
-        # Skip the serialized callback and metadata columns on this hot path
-        if batch = Batch.select(:id, :finished_at, :enqueued_at).find_by(id: batch_id)
-          batch.finish
-        end
+        self.class.finish_batch_for(batch_id)
       end
   end
 end
