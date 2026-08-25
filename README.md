@@ -776,12 +776,9 @@ batch_maintenance:
 
 #### Stalled batches
 
-Maintenance only completes batches their creator *sealed*—batches `SolidQueue::Batch.enqueue` finished filling. A batch that was never sealed is reported rather than completed, because nothing in the queue database distinguishes the two reasons it might be unsealed:
+Maintenance only completes batches their creator *sealed*—batches `SolidQueue::Batch.enqueue` finished filling. A batch created outside any transaction is sealed in the same write as its row, so a process dying mid-creation can't leave an unsealed batch behind. One created inside a transaction can: sealing waits for the commit, and a transaction that's still open, rolled back, or died uncommitted leaves the batch unsealed—indistinguishably so.
 
-- its creator is still filling it, from a transaction that hasn't committed yet. Active Job defers those enqueues until it does, and with a separate queue database the batch row doesn't wait for them.
-- its creator died before sealing it, and never will.
-
-Completing the first kind loses work: the batch finishes with whatever happened to have landed, fires its callbacks, and the real enqueues then raise `SolidQueue::Batch::AlreadyFinished`. Rather than guess, the sweep emits a `stalled_batch.solid_queue` event for each one and leaves it alone.
+Completing an unsealed batch would lose work: it finishes with whatever happened to have landed, fires its callbacks, and enqueues still pending on the transaction then raise `SolidQueue::Batch::AlreadyFinished`. Rather than guess whether more jobs are coming, the sweep emits a `stalled_batch.solid_queue` event for each one and leaves it alone.
 
 To find them, and to adopt one once you've established its creator is gone for good:
 

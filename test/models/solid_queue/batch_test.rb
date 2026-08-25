@@ -473,6 +473,48 @@ class SolidQueue::BatchTest < ActiveSupport::TestCase
     assert_equal 3, batch.completed_jobs
   end
 
+  test "a batch created outside any transaction is sealed with its own row" do
+    skip "sealing on create needs ActiveRecord.all_open_transactions" unless ActiveRecord.respond_to?(:all_open_transactions)
+
+    # Simulate the creator dying before the deferred start runs
+    SolidQueue::Batch.any_instance.stubs(:start)
+
+    jobs_in_transaction = nil
+    batch = SolidQueue::Batch.enqueue do
+      NiceJob.perform_later("world")
+      jobs_in_transaction = SolidQueue::Job.count
+    end
+
+    # Configurations that defer enqueues put no jobs in the batch's own
+    # transaction, so sealing correctly waits for start there
+    skip "enqueues are deferred here, so there was nothing to seal over" if jobs_in_transaction.zero?
+
+    assert batch.reload.enqueued?, "batch should be sealed even though start never ran"
+    assert_empty SolidQueue::Batch.stalled(stalled_for: 0.seconds)
+  end
+
+  test "a batch created inside a transaction is not sealed until it commits" do
+    SolidQueue::Batch.any_instance.stubs(:start)
+
+    batch = nil
+    JobResult.transaction do
+      JobResult.create!(queue_name: "default", status: "")
+      batch = SolidQueue::Batch.enqueue { NiceJob.perform_later("world") }
+    end
+
+    assert_nil batch.reload.enqueued_at, "sealing is left to start when a transaction encloses the batch"
+  end
+
+  test "a batch with no jobs is not sealed on create" do
+    # total_jobs 0 can mean enqueues deferred to a commit that hasn't happened;
+    # sealed empty would mean complete, so sealing must wait for start
+    SolidQueue::Batch.any_instance.stubs(:start)
+
+    batch = SolidQueue::Batch.enqueue { }
+
+    assert_nil batch.reload.enqueued_at
+  end
+
   test "sweep_stalled reports batches that were never sealed instead of completing them" do
     batch = SolidQueue::Batch.enqueue(on_success: BatchCompletionJob) { NiceJob.perform_later("world") }
 

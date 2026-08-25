@@ -64,19 +64,16 @@ module SolidQueue
             finished
           end
 
-          # An unsealed batch is one of two things, and nothing in the queue
-          # database tells them apart:
-          #
-          #   - its creator is still filling it, from a transaction that hasn't
-          #     committed yet. Active Job defers those enqueues until it does,
-          #     and with a separate queue database the batch row doesn't wait.
-          #   - its creator died before sealing it, and never will.
-          #
-          # Sealing the first kind loses work: the batch finishes as completed
+          # Batches created outside any transaction seal in the same write as
+          # their row, so a crashed creator can't leave one behind. An unsealed
+          # batch therefore came from inside a transaction—one still filling it,
+          # rolled back, or died uncommitted—or is still waiting on deferred
+          # enqueues. Completing any of those loses work: the batch finishes
           # with whatever happened to have landed, fires its callbacks, and the
-          # real enqueues then raise AlreadyFinished. Since the two are
-          # indistinguishable, report them and let an operator decide, rather
-          # than guessing and reporting success for work that never ran.
+          # real enqueues then raise AlreadyFinished. Since "still coming" and
+          # "never coming" are indistinguishable here, report them and let an
+          # operator decide, rather than guessing and reporting success for
+          # work that never ran.
           def report_stalled_batches(stalled_for:, batch_size:)
             stalled_batches = stalled(stalled_for: stalled_for)
             count = stalled_batches.count
