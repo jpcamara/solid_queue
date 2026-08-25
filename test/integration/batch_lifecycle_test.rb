@@ -127,6 +127,92 @@ class BatchLifecycleTest < ActiveSupport::TestCase
     assert_finished_in_order(job!(job1), batch1.reload)
   end
 
+  test "a batch filled from a transaction that outlives the stalled window still completes correctly" do
+    skip if Rails::VERSION::MAJOR == 7 && Rails::VERSION::MINOR == 1
+
+    ApplicationJob.enqueue_after_transaction_commit = true
+
+    batch = nil
+    JobResult.transaction do
+      JobResult.create!(queue_name: "default", status: "")
+
+      batch = SolidQueue::Batch.enqueue(on_success: BatchOnSuccessJob.new("late")) do
+        AddToBufferJob.perform_later("late")
+      end
+
+      # The batch row commits before this transaction does, so maintenance
+      # running elsewhere can reach it while the enqueues are still pending
+      SolidQueue::Batch.where(id: batch.id).update_all(created_at: 10.minutes.ago)
+      SolidQueue::Batch.sweep_stalled
+
+      assert_not batch.reload.finished?, "maintenance must not complete a batch still being filled"
+    end
+
+    assert_equal 1, batch.reload.total_jobs
+
+    @dispatcher.start
+    @worker.start
+
+    wait_for_batches_to_finish_for(5.seconds)
+    wait_for_jobs_to_finish_for(5.seconds)
+
+    assert batch.reload.finished?
+    assert_equal [ "late", "late: 1 jobs succeeded!" ].sort, JobBuffer.values.sort
+  end
+
+  test "a batch from a rolled-back transaction never reports success" do
+    skip if Rails::VERSION::MAJOR == 7 && Rails::VERSION::MINOR == 1
+
+    batch = nil
+    JobResult.transaction do
+      JobResult.create!(queue_name: "default", status: "")
+
+      batch = SolidQueue::Batch.enqueue(on_success: BatchOnSuccessJob.new("phantom")) do
+        AddToBufferJob.perform_later("rolled back")
+      end
+
+      raise ActiveRecord::Rollback
+    end
+
+    # Maintenance finds the leftover batch old and unstarted, and leaves it alone
+    SolidQueue::Batch.where(id: batch.id).update_all(created_at: 10.minutes.ago)
+    SolidQueue::Batch.sweep_stalled
+
+    @dispatcher.start
+    @worker.start
+    wait_for_jobs_to_finish_for(5.seconds)
+
+    assert_not batch.reload.finished?
+    assert_nil batch.enqueued_at
+    assert_not_includes JobBuffer.values, "phantom: 1 jobs succeeded!"
+  end
+
+  test "a batch whose creator dies right after enqueue is already complete" do
+    skip unless ActiveRecord.respond_to?(:all_open_transactions)
+
+    # The deferred start never runs, as if the process died the moment enqueue returned
+    SolidQueue::Batch.any_instance.stubs(:start)
+
+    jobs_in_transaction = nil
+    batch = SolidQueue::Batch.enqueue(on_success: BatchOnSuccessJob.new("sealed")) do
+      AddToBufferJob.perform_later("sealed")
+      jobs_in_transaction = SolidQueue::Job.count
+    end
+
+    skip "enqueues are deferred here, so sealing waits for start" if jobs_in_transaction.zero?
+
+    assert batch.reload.enqueued?, "the batch sealed in the same commit as its row"
+
+    @dispatcher.start
+    @worker.start
+
+    wait_for_batches_to_finish_for(5.seconds)
+    wait_for_jobs_to_finish_for(5.seconds)
+
+    assert batch.reload.finished?
+    assert_equal [ "sealed", "sealed: 1 jobs succeeded!" ].sort, JobBuffer.values.sort
+  end
+
   test "prebuilt jobs capture their batch before enqueue is deferred" do
     skip if Rails::VERSION::MAJOR == 7 && Rails::VERSION::MINOR == 1
 

@@ -63,10 +63,21 @@ module SolidQueue
         raise AlreadyFinished, "Can't enqueue an already finished batch"
       end
 
+      # Decided before opening our own transaction: with none open anywhere,
+      # nothing outside this method can roll the batch back or defer its jobs.
+      seal_on_create = no_enclosing_transactions?
+
       transaction do
         save! if new_record?
 
         self.class.wrap_in_batch_context(id) { block&.call(self) }
+
+        # Sealing in the same transaction as the batch row makes the crashed
+        # creator unrepresentable: either nothing commits, or a sealed batch
+        # and its jobs commit together. Only batches that got jobs qualify;
+        # one with none may still be waiting on deferred enqueues, and sealed
+        # empty means complete.
+        seal_if_filled if seal_on_create
 
         if ActiveRecord.respond_to?(:after_all_transactions_commit)
           ActiveRecord.after_all_transactions_commit { start }
@@ -104,6 +115,14 @@ module SolidQueue
 
       def mark_as_enqueued
         Batch.where(id: id, enqueued_at: nil).update_all(enqueued_at: Time.current)
+      end
+
+      def seal_if_filled
+        Batch.where(id: id, enqueued_at: nil).where.not(total_jobs: 0).update_all(enqueued_at: Time.current)
+      end
+
+      def no_enclosing_transactions?
+        ActiveRecord.respond_to?(:all_open_transactions) && ActiveRecord.all_open_transactions.none?
       end
 
       def finalize

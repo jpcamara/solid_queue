@@ -473,18 +473,140 @@ class SolidQueue::BatchTest < ActiveSupport::TestCase
     assert_equal 3, batch.completed_jobs
   end
 
-  test "sweep_stalled starts batches whose creating process died before starting them" do
-    batch = SolidQueue::Batch.enqueue { NiceJob.perform_later("world") }
+  test "a batch created outside any transaction is sealed with its own row" do
+    skip "sealing on create needs ActiveRecord.all_open_transactions" unless ActiveRecord.respond_to?(:all_open_transactions)
 
-    # Simulate a process that crashed after committing jobs but before start
+    # Simulate the creator dying before the deferred start runs
+    SolidQueue::Batch.any_instance.stubs(:start)
+
+    jobs_in_transaction = nil
+    batch = SolidQueue::Batch.enqueue do
+      NiceJob.perform_later("world")
+      jobs_in_transaction = SolidQueue::Job.count
+    end
+
+    # Configurations that defer enqueues put no jobs in the batch's own
+    # transaction, so sealing correctly waits for start there
+    skip "enqueues are deferred here, so there was nothing to seal over" if jobs_in_transaction.zero?
+
+    assert batch.reload.enqueued?, "batch should be sealed even though start never ran"
+    assert_empty SolidQueue::Batch.stalled(stalled_for: 0.seconds)
+  end
+
+  test "a batch created inside a transaction is not sealed until it commits" do
+    SolidQueue::Batch.any_instance.stubs(:start)
+
+    batch = nil
+    JobResult.transaction do
+      JobResult.create!(queue_name: "default", status: "")
+      batch = SolidQueue::Batch.enqueue { NiceJob.perform_later("world") }
+    end
+
+    assert_nil batch.reload.enqueued_at, "sealing is left to start when a transaction encloses the batch"
+  end
+
+  test "a batch with no jobs is not sealed on create" do
+    # total_jobs 0 can mean enqueues deferred to a commit that hasn't happened;
+    # sealed empty would mean complete, so sealing must wait for start
+    SolidQueue::Batch.any_instance.stubs(:start)
+
+    batch = SolidQueue::Batch.enqueue { }
+
+    assert_nil batch.reload.enqueued_at
+  end
+
+  test "sweep_stalled reports batches that were never sealed instead of completing them" do
+    batch = SolidQueue::Batch.enqueue(on_success: BatchCompletionJob) { NiceJob.perform_later("world") }
+
+    # A batch whose creator never called start: either it died, or it's still
+    # filling the batch from a transaction that hasn't committed
     batch.update_columns(enqueued_at: nil, created_at: 10.minutes.ago)
     batch.jobs.sole.finished!
+    SolidQueue::Job.where(class_name: "BatchCompletionJob").delete_all
+
+    events = []
+    callback = ->(*args) { events << ActiveSupport::Notifications::Event.new(*args) }
+    ActiveSupport::Notifications.subscribed(callback, "stalled_batch.solid_queue") do
+      SolidQueue::Batch.sweep_stalled
+    end
 
     assert_not batch.reload.finished?
+    assert_nil batch.enqueued_at
+    assert_empty SolidQueue::Job.where(class_name: "BatchCompletionJob")
+
+    assert_equal 1, events.size
+    assert_equal batch.id, events.sole.payload[:batch_id]
+  end
+
+  test "sweep_stalled removes unsealed batches abandoned past the expiry window" do
+    skip "Rails 7.1 seals batches on create via after_commit" unless ActiveRecord.respond_to?(:all_open_transactions)
+
+    batch = nil
+    JobResult.transaction do
+      JobResult.create!(queue_name: "default", status: "")
+      batch = SolidQueue::Batch.enqueue(on_success: BatchCompletionJob) { NiceJob.perform_later("world") }
+      raise ActiveRecord::Rollback
+    end
+
+    skip "the rollback removed everything here" if SolidQueue::Batch.find_by(id: batch.id).nil?
+
+    batch.update_columns(created_at: 2.days.ago)
+
+    SolidQueue::Batch.sweep_stalled
+
+    assert_nil SolidQueue::Batch.find_by(id: batch.id)
+    assert_empty SolidQueue::Job.where(class_name: "BatchCompletionJob"), "no callbacks for a rolled-back batch"
+  end
+
+  test "sweep_stalled leaves unsealed batches younger than the expiry window" do
+    batch = SolidQueue::Batch.enqueue { NiceJob.perform_later("world") }
+    batch.update_columns(enqueued_at: nil, created_at: 10.minutes.ago)
+
+    SolidQueue::Batch.sweep_stalled
+
+    assert SolidQueue::Batch.exists?(batch.id)
+    assert_nil batch.reload.enqueued_at
+  end
+
+  test "sweep_stalled counts stalled batches in its payload" do
+    batch = SolidQueue::Batch.enqueue { NiceJob.perform_later("world") }
+    batch.update_columns(enqueued_at: nil, created_at: 10.minutes.ago)
+
+    payload = nil
+    callback = ->(*args) { payload = ActiveSupport::Notifications::Event.new(*args).payload }
+    ActiveSupport::Notifications.subscribed(callback, "sweep_stalled_batches.solid_queue") do
+      SolidQueue::Batch.sweep_stalled
+    end
+
+    assert_equal 1, payload[:stalled_batches]
+  end
+
+  test "stalled finds unsealed batches and start adopts one deliberately" do
+    batch = SolidQueue::Batch.enqueue(on_success: BatchCompletionJob) { NiceJob.perform_later("world") }
+    batch.update_columns(enqueued_at: nil, created_at: 10.minutes.ago)
+    batch.jobs.sole.finished!
+    SolidQueue::Job.where(class_name: "BatchCompletionJob").delete_all
+
+    assert_equal [ batch ], SolidQueue::Batch.stalled.to_a
+
+    batch.start
+
+    assert batch.reload.finished?
+    assert_equal 1, SolidQueue::Job.where(class_name: "BatchCompletionJob").count
+  end
+
+  test "sweep_stalled still finishes sealed batches with no tracking rows left" do
+    batch = SolidQueue::Batch.enqueue(on_success: BatchCompletionJob) { NiceJob.perform_later("world") }
+    SolidQueue::Job.where(class_name: "BatchCompletionJob").delete_all
+
+    # Sealed by its creator, but its tracking row was removed without callbacks
+    assert batch.reload.enqueued?
+    batch.batch_executions.delete_all
 
     SolidQueue::Batch.sweep_stalled
 
     assert batch.reload.finished?
+    assert_equal 1, SolidQueue::Job.where(class_name: "BatchCompletionJob").count
   end
 
   test "conflict-discarded jobs count the same for single and bulk enqueues" do
