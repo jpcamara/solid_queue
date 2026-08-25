@@ -18,10 +18,11 @@ module SolidQueue
       end
 
       class_methods do
-        def sweep_stalled(stalled_for: 5.minutes, batch_size: 500)
-          SolidQueue.instrument(:sweep_stalled_batches, stalled_for: stalled_for, stale_executions: 0, finished_batches: 0, stalled_batches: 0) do |payload|
+        def sweep_stalled(stalled_for: 5.minutes, expire_after: 1.day, batch_size: 500)
+          SolidQueue.instrument(:sweep_stalled_batches, stalled_for: stalled_for, expire_after: expire_after, stale_executions: 0, finished_batches: 0, expired_batches: 0, stalled_batches: 0) do |payload|
             payload[:stale_executions] = sweep_stale_executions(batch_size:)
             payload[:finished_batches] = finish_stalled_batches(batch_size:)
+            payload[:expired_batches] = expire_abandoned_batches(expire_after:, batch_size:)
             payload[:stalled_batches] = report_stalled_batches(stalled_for:, batch_size:)
           end
         end
@@ -62,6 +63,28 @@ module SolidQueue
             end
 
             finished
+          end
+
+          # A batch unsealed long past any reasonable transaction was created in
+          # a transaction that will never commit: its data rolled back, so the
+          # batch ends the same way—removed, as if never created. Not completing
+          # it means no callbacks ever fire over rolled-back work; not keeping
+          # it means nothing accumulates or needs monitoring. Jobs that reached
+          # the queue before the rollback already ran and stay untouched, just
+          # like jobs enqueued outside a batch in a rolled-back transaction.
+          #
+          # A transaction that outlives expire_after and then commits raises
+          # AlreadyFinished from its deferred enqueues: loud, and without
+          # firing success callbacks over lost work.
+          def expire_abandoned_batches(expire_after:, batch_size:)
+            expired = 0
+
+            unsealed.where(created_at: ...expire_after.ago).find_each(batch_size: batch_size) do |batch|
+              expired += 1
+              batch.destroy
+            end
+
+            expired
           end
 
           # Batches created outside any transaction seal in the same write as

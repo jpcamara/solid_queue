@@ -778,18 +778,19 @@ batch_maintenance:
 
 Maintenance only completes batches their creator *sealed*—batches `SolidQueue::Batch.enqueue` finished filling. A batch created outside any transaction is sealed in the same write as its row, so a process dying mid-creation can't leave an unsealed batch behind. One created inside a transaction can: sealing waits for the commit, and a transaction that's still open, rolled back, or died uncommitted leaves the batch unsealed—indistinguishably so.
 
-Completing an unsealed batch would lose work: it finishes with whatever happened to have landed, fires its callbacks, and enqueues still pending on the transaction then raise `SolidQueue::Batch::AlreadyFinished`. Rather than guess whether more jobs are coming, the sweep emits a `stalled_batch.solid_queue` event for each one and leaves it alone.
+Completing an unsealed batch would lose work: it finishes with whatever happened to have landed, fires its callbacks, and enqueues still pending on the transaction then raise `SolidQueue::Batch::AlreadyFinished`. Rather than guess whether more jobs are coming, the sweep emits a `stalled_batch.solid_queue` event for each one and waits.
 
-To find them, and to adopt one once you've established its creator is gone for good:
+An unsealed batch doesn't wait forever. One still unsealed a day after creation came from a transaction that will never commit, so it ends the way its data did: the sweep removes it, as if it was never created. No callbacks fire, and nothing accumulates or needs monitoring. Jobs that reached the queue before the rollback have already run and stay untouched—the same behaviour as jobs enqueued outside a batch in a rolled-back transaction.
+
+In between, batches are yours to inspect or resolve early:
 
 ```ruby
 SolidQueue::Batch.stalled                          # unsealed for more than 5 minutes
-SolidQueue::Batch.stalled(stalled_for: 1.hour)
-
-SolidQueue::Batch.stalled.find_each(&:start)       # seal and complete them yourself
+SolidQueue::Batch.stalled.find_each(&:start)       # complete them yourself
+SolidQueue::Batch.stalled.each(&:destroy)          # or discard them early
 ```
 
-Jobs already in a stalled batch run normally—only the batch's own completion waits.
+Jobs already in a stalled batch run normally—only the batch's own completion waits. Keep transactions that create batches shorter than the expiry window (`expire_after` on `sweep_stalled`, one day by default): a transaction that outlives it and then commits finds its batch gone and raises `SolidQueue::Batch::AlreadyFinished` from the deferred enqueues.
 
 ### Clearing batches
 

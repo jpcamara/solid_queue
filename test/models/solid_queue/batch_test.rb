@@ -538,6 +538,36 @@ class SolidQueue::BatchTest < ActiveSupport::TestCase
     assert_equal batch.id, events.sole.payload[:batch_id]
   end
 
+  test "sweep_stalled removes unsealed batches abandoned past the expiry window" do
+    skip "Rails 7.1 seals batches on create via after_commit" unless ActiveRecord.respond_to?(:all_open_transactions)
+
+    batch = nil
+    JobResult.transaction do
+      JobResult.create!(queue_name: "default", status: "")
+      batch = SolidQueue::Batch.enqueue(on_success: BatchCompletionJob) { NiceJob.perform_later("world") }
+      raise ActiveRecord::Rollback
+    end
+
+    skip "the rollback removed everything here" if SolidQueue::Batch.find_by(id: batch.id).nil?
+
+    batch.update_columns(created_at: 2.days.ago)
+
+    SolidQueue::Batch.sweep_stalled
+
+    assert_nil SolidQueue::Batch.find_by(id: batch.id)
+    assert_empty SolidQueue::Job.where(class_name: "BatchCompletionJob"), "no callbacks for a rolled-back batch"
+  end
+
+  test "sweep_stalled leaves unsealed batches younger than the expiry window" do
+    batch = SolidQueue::Batch.enqueue { NiceJob.perform_later("world") }
+    batch.update_columns(enqueued_at: nil, created_at: 10.minutes.ago)
+
+    SolidQueue::Batch.sweep_stalled
+
+    assert SolidQueue::Batch.exists?(batch.id)
+    assert_nil batch.reload.enqueued_at
+  end
+
   test "sweep_stalled counts stalled batches in its payload" do
     batch = SolidQueue::Batch.enqueue { NiceJob.perform_later("world") }
     batch.update_columns(enqueued_at: nil, created_at: 10.minutes.ago)
