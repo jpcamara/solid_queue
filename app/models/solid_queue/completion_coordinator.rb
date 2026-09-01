@@ -23,6 +23,7 @@ module SolidQueue
       @mutex = Mutex.new
       @work_cv = ConditionVariable.new
       @pending = nil
+      @flush_pace = 0.0
     end
 
     # The first completion to arrive while no flush is running flushes
@@ -38,7 +39,7 @@ module SolidQueue
       waiter = nil
       @mutex.synchronize do
         if @flushing
-          waiter = Thread::Queue.new
+          waiter = (Thread.current[:sq_completion_waiter] ||= Thread::Queue.new)
           my_batch = (@pending ||= Batch.new([], []))
           my_batch.job_ids << execution.job_id
           my_batch.waiters << waiter
@@ -56,6 +57,7 @@ module SolidQueue
       end
 
       if lead
+        pace_and_collect(my_batch)
         error = lead_flush(my_batch)
         raise error if error
       else
@@ -71,10 +73,35 @@ module SolidQueue
     end
 
     private
+      # Group-commit collection: a fresh leader waits one flush-duration
+      # (measured, not guessed) before flushing, so completions from the same
+      # claim burst commit together instead of one commit each. Promoted
+      # leaders flush back-to-back and their batches size themselves.
+      def pace_and_collect(my_batch)
+        return unless @flush_pace > 0
+
+        sleep(@flush_pace)
+        @mutex.synchronize do
+          if (joined = @pending)
+            @pending = nil
+            my_batch.job_ids.concat(joined.job_ids)
+            my_batch.waiters.concat(joined.waiters)
+          end
+        end
+      end
+
+      MAX_FLUSH_PACE = 0.0007
+
+      def record_flush_pace(started, finished)
+        duration = finished - started
+        pace = @flush_pace.zero? ? duration : @flush_pace * 0.8 + duration * 0.2
+        @flush_pace = pace > MAX_FLUSH_PACE ? MAX_FLUSH_PACE : pace
+      end
+
       # Single-writer databases do best with a single writer thread: pool
       # threads queue their completions and one flusher owns all the flushing
       def threaded_finish(execution)
-        waiter = Thread::Queue.new
+        waiter = (Thread.current[:sq_completion_waiter] ||= Thread::Queue.new)
         @mutex.synchronize do
           ensure_flusher
           batch = (@pending ||= Batch.new([], []))
@@ -115,11 +142,13 @@ module SolidQueue
       # and no dedicated thread sits idle between them
       def lead_flush(batch)
         error = nil
+        started = ::Process.clock_gettime(::Process::CLOCK_MONOTONIC)
         begin
           flush(batch.job_ids)
         rescue => e
           error = e
         end
+        record_flush_pace(started, ::Process.clock_gettime(::Process::CLOCK_MONOTONIC))
 
         next_batch = nil
         @mutex.synchronize do
@@ -160,11 +189,14 @@ module SolidQueue
           client.next_result while client.next_result
         else
           connection = flusher_ar_connection
-          now = connection.quote(Time.current)
+          @sqlite_delete_stmt ||= connection.raw_connection.prepare("DELETE FROM solid_queue_claimed_executions WHERE job_id IN (SELECT value FROM json_each(?))")
+          @sqlite_update_stmt ||= connection.raw_connection.prepare("UPDATE solid_queue_jobs SET finished_at = ? WHERE id IN (SELECT value FROM json_each(?))")
+          ids_json = "[#{ids}]"
+          now = connection.quoted_date(Time.current)
           SqliteWriterFunnel.acquire(ClaimedExecution.connection_pool) do
             connection.transaction do
-              connection.execute("DELETE FROM solid_queue_claimed_executions WHERE job_id IN (#{ids})")
-              connection.execute("UPDATE solid_queue_jobs SET finished_at = #{now} WHERE id IN (#{ids})")
+              @sqlite_delete_stmt.execute(ids_json).to_a
+              @sqlite_update_stmt.execute(now, ids_json).to_a
             end
           end
         end

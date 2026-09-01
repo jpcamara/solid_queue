@@ -58,7 +58,8 @@ module SolidQueue
 
       # Same rows and locks as select_and_lock + claiming: candidates locked
       # with SKIP LOCKED (only the ready rows, via FOR UPDATE OF), jobs read in
-      # the same query, then two raw statements move them ready -> claimed
+      # the same query, then two raw statements move them ready -> claimed.
+      # A multi-statement client runs the whole transaction in two round trips.
       def mysql_claim(queue_relation, process_id, limit)
         return [] if limit <= 0
 
@@ -66,76 +67,129 @@ module SolidQueue
         # Same row locks on the rows we take; READ COMMITTED skips the gap
         # locks REPEATABLE READ adds to the ordered range scan, which serialize
         # concurrent claimers against enqueuers on the index head
-        connection.execute("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
-        transaction do
-          result = connection.select_all(<<~SQL)
-            SELECT re.id AS ready_id, #{hydration_columns}
-            FROM solid_queue_ready_executions re
-            INNER JOIN solid_queue_jobs jobs ON jobs.id = re.job_id
-            #{conditions.gsub("solid_queue_ready_executions", "re")}
-            ORDER BY re.priority ASC, re.job_id ASC
-            LIMIT #{limit.to_i}
-            FOR UPDATE OF re SKIP LOCKED
-          SQL
-          next [] if result.rows.empty?
+        select_sql = <<~SQL
+          SELECT re.id AS ready_id, #{hydration_columns}
+          FROM solid_queue_ready_executions re
+          INNER JOIN solid_queue_jobs jobs ON jobs.id = re.job_id
+          #{conditions.gsub("solid_queue_ready_executions", "re")}
+          ORDER BY re.priority ASC, re.job_id ASC
+          LIMIT #{limit.to_i}
+          FOR UPDATE OF re SKIP LOCKED
+        SQL
 
-          job_columns = SolidQueue::Job.column_names
-          now = connection.quote(Time.current)
-          claimed = result.rows.map do |row|
-            attrs = result.columns.zip(row).to_h
-            job = SolidQueue::Job.instantiate(attrs.slice(*job_columns))
-            execution = SolidQueue::ClaimedExecution.instantiate_claimed(job_id: job.id, process_id: process_id)
-            execution.association(:job).target = job
-            [ attrs["ready_id"], execution ]
+        claim_mysql_mutex.synchronize do
+          client = claim_mysql_client
+          begin
+            result = client.query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED; BEGIN; #{select_sql}")
+            while client.next_result
+              r = client.store_result
+              result = r if r
+            end
+
+            if result.nil? || result.count.zero?
+              client.query("ROLLBACK")
+              next []
+            end
+
+            job_columns = SolidQueue::Job.column_names
+            now = Time.current.utc.strftime("'%Y-%m-%d %H:%M:%S.%6N'")
+            claimed = result.map do |attrs|
+              job = SolidQueue::Job.instantiate(attrs.slice(*job_columns))
+              execution = SolidQueue::ClaimedExecution.instantiate_claimed(job_id: job.id, process_id: process_id)
+              execution.association(:job).target = job
+              [ attrs["ready_id"], execution ]
+            end
+
+            values = claimed.map { |_, e| "(#{e.job_id}, #{process_id ? process_id.to_i : "NULL"}, #{now})" }.join(",")
+            client.query(<<~SQL)
+              INSERT INTO solid_queue_claimed_executions (job_id, process_id, created_at) VALUES #{values};
+              DELETE FROM solid_queue_ready_executions WHERE id IN (#{claimed.map(&:first).join(",")});
+              COMMIT
+            SQL
+            client.next_result while client.next_result
+
+            claimed.map(&:last)
+          rescue Exception
+            begin client.query("ROLLBACK"); rescue Exception; @claim_mysql_client = nil; end
+            raise
           end
-
-          values = claimed.map { |_, e| "(#{e.job_id}, #{process_id ? connection.quote(process_id) : "NULL"}, #{now})" }.join(",")
-          connection.execute("INSERT INTO solid_queue_claimed_executions (job_id, process_id, created_at) VALUES #{values}")
-          connection.execute("DELETE FROM solid_queue_ready_executions WHERE id IN (#{claimed.map(&:first).join(",")})")
-
-          claimed.map(&:last)
         end.tap do |executions|
-          SolidQueue.instrument(:claim, process_id: process_id, job_ids: executions.map(&:job_id),
-            claimed_job_ids: executions.map(&:job_id), size: executions.size)
+          job_ids = executions.map(&:job_id)
+          SolidQueue.instrument(:claim, process_id: process_id, job_ids: job_ids,
+            claimed_job_ids: job_ids, size: executions.size)
+        end
+      end
+
+      def claim_mysql_mutex
+        @claim_mysql_mutex ||= Mutex.new
+      end
+
+      # The claimer owns one multi-statement connection for its whole life,
+      # holding the same locks and isolation an Active Record one would
+      def claim_mysql_client
+        @claim_mysql_client ||= begin
+          config = connection_pool.db_config.configuration_hash
+          Mysql2::Client.new(config.merge(flags: Mysql2::Client::MULTI_STATEMENTS))
         end
       end
 
       # SQLite is single-writer, so candidates need no row locks: read them
       # joined with their jobs in one query, then move them ready -> claimed
-      # with two raw statements in one transaction. Same rows, same atomicity.
+      # with two statements in one transaction. Same rows, same atomicity.
+      # All three statements are prepared once per connection and shape;
+      # id lists bind as JSON arrays so the shapes stay stable.
       def sqlite_claim(queue_relation, process_id, limit)
         return [] if limit <= 0
 
-        candidates_sql = queue_relation.ordered.limit(limit).select(:id, :job_id).to_sql
-        join_sql = <<~SQL
-          SELECT c.id AS ready_id, #{hydration_columns}
-          FROM (#{candidates_sql}) c INNER JOIN solid_queue_jobs jobs ON jobs.id = c.job_id
-        SQL
-        result = connection.select_all(join_sql)
-        return [] if result.rows.empty?
+        candidates_sql = queue_relation.ordered.limit(limit).select(:id, :job_id).to_sql.sub(/LIMIT \d+\z/, "LIMIT ?")
+        select_stmt = sqlite_prepared(candidates_sql) do
+          <<~SQL
+            SELECT c.id AS ready_id, #{hydration_columns}
+            FROM (#{candidates_sql}) c INNER JOIN solid_queue_jobs jobs ON jobs.id = c.job_id
+          SQL
+        end
+        columns = select_stmt.columns
+        rows = select_stmt.execute(limit.to_i).to_a
+        return [] if rows.empty?
 
         job_columns = SolidQueue::Job.column_names
-        now = connection.quote(Time.current)
-        claimed = result.rows.map do |row|
-          attrs = result.columns.zip(row).to_h
+        claimed = rows.map do |row|
+          attrs = row.is_a?(Hash) ? row : columns.zip(row).to_h
           job = SolidQueue::Job.instantiate(attrs.slice(*job_columns))
           execution = SolidQueue::ClaimedExecution.instantiate_claimed(job_id: job.id, process_id: process_id)
           execution.association(:job).target = job
           [ attrs["ready_id"], execution ]
         end
 
+        insert_stmt = sqlite_prepared("claim_insert") do
+          "INSERT INTO solid_queue_claimed_executions (job_id, process_id, created_at) SELECT value, ?, ? FROM json_each(?)"
+        end
+        delete_stmt = sqlite_prepared("claim_delete") do
+          "DELETE FROM solid_queue_ready_executions WHERE id IN (SELECT value FROM json_each(?))"
+        end
+        job_ids_json = "[#{claimed.map { |_, e| e.job_id }.join(",")}]"
+        now = connection.quoted_date(Time.current)
+
         SolidQueue::SqliteWriterFunnel.acquire(connection_pool) do
           transaction do
-            values = claimed.map { |_, e| "(#{e.job_id}, #{process_id ? connection.quote(process_id) : "NULL"}, #{now})" }.join(",")
-            connection.execute("INSERT INTO solid_queue_claimed_executions (job_id, process_id, created_at) VALUES #{values}")
-            connection.execute("DELETE FROM solid_queue_ready_executions WHERE id IN (#{claimed.map(&:first).join(",")})")
+            insert_stmt.execute(process_id, now, job_ids_json).to_a
+            delete_stmt.execute("[#{claimed.map(&:first).join(",")}]").to_a
           end
         end
 
         claimed.map(&:last).tap do |executions|
-          SolidQueue.instrument(:claim, process_id: process_id, job_ids: executions.map(&:job_id),
-            claimed_job_ids: executions.map(&:job_id), size: executions.size)
+          job_ids = executions.map(&:job_id)
+          SolidQueue.instrument(:claim, process_id: process_id, job_ids: job_ids,
+            claimed_job_ids: job_ids, size: executions.size)
         end
+      end
+
+      # Statements prepared once per connection and shape, on the same
+      # connection the claim's transaction runs on
+      def sqlite_prepared(key)
+        conn = connection
+        prepared = conn.instance_variable_get(:@sq_prepared_claims) || conn.instance_variable_set(:@sq_prepared_claims, {})
+        prepared[key] ||= conn.raw_connection.prepare(yield)
       end
 
 
@@ -193,8 +247,9 @@ module SolidQueue
           execution.association(:job).target = job
           execution
         end.tap do |claimed|
-          SolidQueue.instrument(:claim, process_id: process_id, job_ids: claimed.map(&:job_id),
-            claimed_job_ids: claimed.map(&:job_id), size: claimed.size)
+          job_ids = claimed.map(&:job_id)
+          SolidQueue.instrument(:claim, process_id: process_id, job_ids: job_ids,
+            claimed_job_ids: job_ids, size: claimed.size)
         end
       end
 
