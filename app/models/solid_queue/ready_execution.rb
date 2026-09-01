@@ -41,6 +41,13 @@ module SolidQueue
         connection.adapter_name == "PostgreSQL"
       end
 
+      # Only the columns the execution path reads: converting and instantiating
+      # unused columns is measurable client CPU at high claim rates
+      def hydration_columns
+        @hydration_columns ||= (%w[ id active_job_id queue_name class_name arguments priority concurrency_key batch_id ] &
+          SolidQueue::Job.column_names).map { |c| "jobs.#{c}" }.join(", ")
+      end
+
       def sqlite_claim_supported?
         connection.adapter_name == "SQLite"
       end
@@ -62,7 +69,7 @@ module SolidQueue
         connection.execute("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
         transaction do
           result = connection.select_all(<<~SQL)
-            SELECT re.id AS ready_id, jobs.*
+            SELECT re.id AS ready_id, #{hydration_columns}
             FROM solid_queue_ready_executions re
             INNER JOIN solid_queue_jobs jobs ON jobs.id = re.job_id
             #{conditions.gsub("solid_queue_ready_executions", "re")}
@@ -101,7 +108,7 @@ module SolidQueue
 
         candidates_sql = queue_relation.ordered.limit(limit).select(:id, :job_id).to_sql
         join_sql = <<~SQL
-          SELECT c.id AS ready_id, jobs.*
+          SELECT c.id AS ready_id, #{hydration_columns}
           FROM (#{candidates_sql}) c INNER JOIN solid_queue_jobs jobs ON jobs.id = c.job_id
         SQL
         result = connection.select_all(join_sql)
@@ -170,7 +177,7 @@ module SolidQueue
           )
           SELECT claimed.id AS claimed_id, claimed.job_id AS claimed_job_id,
                  claimed.process_id AS claimed_process_id, claimed.created_at AS claimed_created_at,
-                 jobs.*
+                 #{hydration_columns}
           FROM claimed INNER JOIN solid_queue_jobs jobs ON jobs.id = claimed.job_id
         SQL
 

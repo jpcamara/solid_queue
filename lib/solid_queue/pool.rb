@@ -66,7 +66,9 @@ module SolidQueue
       def restore_capacity
         should_notify = mutex.synchronize do
           @available_capacity += 1
-          @available_capacity.positive?
+          # Waking the poller costs a syscall; half-pool and full-pool refill
+          # points keep it fed without a wake per completion
+          @available_capacity == size || @available_capacity == (size + 1) / 2
         end
 
         on_idle&.call if should_notify
