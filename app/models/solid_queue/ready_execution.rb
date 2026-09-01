@@ -25,6 +25,23 @@ module SolidQueue
         connection.adapter_name == "PostgreSQL"
       end
 
+
+      # PREPARE the claim once per connection and shape: the CTE is large and
+      # re-parsing and re-planning it every poll costs more than running it
+      def execute_prepared_claim(sql, shape_key)
+        conn = connection
+        prepared = conn.instance_variable_get(:@sq_prepared_claims) || conn.instance_variable_set(:@sq_prepared_claims, {})
+        name = prepared[shape_key]
+
+        unless name
+          name = "sq_claim_#{prepared.size}"
+          conn.execute("PREPARE #{name} AS #{sql}")
+          prepared[shape_key] = name
+        end
+
+        conn.select_all("EXECUTE #{name}")
+      end
+
       # The same rows, locks and atomicity as select_and_lock + claiming, in
       # one statement: candidates are locked with SKIP LOCKED, moved into
       # claimed executions and deleted from ready, with the job row hydrated
@@ -33,6 +50,8 @@ module SolidQueue
         return [] if limit <= 0
 
         candidates_sql = queue_relation.ordered.limit(limit).non_blocking_lock.select(:id, :job_id).to_sql
+
+        @claim_sql_cache ||= {}
         sql = <<~SQL
           WITH candidates AS (#{candidates_sql}),
           deleted AS (
@@ -49,7 +68,7 @@ module SolidQueue
           FROM claimed INNER JOIN solid_queue_jobs jobs ON jobs.id = claimed.job_id
         SQL
 
-        result = connection.select_all(sql)
+        result = execute_prepared_claim(sql, candidates_sql)
         job_columns = SolidQueue::Job.column_names
         result.rows.map do |row|
           attrs = result.columns.zip(row).to_h
