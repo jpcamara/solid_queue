@@ -1,35 +1,15 @@
 # frozen_string_literal: true
 
 module SolidQueue
-  # App-side group commit for plain-job completions. Completions arriving
-  # together share one atomic flush; each thread blocks until its own group is
-  # durable, so per-job durability and the crash-replay window are identical
-  # to the per-job path. Groups flush concurrently on their leaders' own
-  # connections — a group never queues behind the previous one.
+  # Group commit for plain-job completions, driven by a dedicated flusher
+  # thread per process. Completing threads enqueue their job and block until
+  # the flusher has committed their batch, so per-job durability and the
+  # crash-replay window are identical to the per-job path. The flusher drains
+  # everything pending into one atomic flush per cycle, which sizes batches
+  # to the flush latency automatically and keeps claiming and flushing
+  # overlapped instead of convoying.
   class CompletionCoordinator
-    # How long a group stays open for stragglers before its leader flushes.
-    # Bounded, synchronous latency traded for larger shared fsyncs.
-    GATHER_WINDOW = 0.0003
-
-    class Group
-      attr_reader :entries, :cv, :leader_cv
-      attr_accessor :done, :error, :sealed
-
-      def initialize
-        @entries = []
-        @cv = ConditionVariable.new
-        @leader_cv = ConditionVariable.new
-        @done = false
-        @sealed = false
-        @error = nil
-      end
-    end
-
-    class << self
-      # Hint from the worker: a group this large has everyone on board, so its
-      # leader can flush without waiting out the gather window
-      attr_accessor :target_group_size
-    end
+    Batch = Struct.new(:job_ids, :waiters)
 
     class << self
       def instance
@@ -41,72 +21,69 @@ module SolidQueue
 
     def initialize
       @mutex = Mutex.new
-      @open_group = nil
+      @work_cv = ConditionVariable.new
+      @pending = nil
     end
 
     def finish(execution)
-      group = nil
-      leader = false
-
-      target = self.class.target_group_size
+      waiter = Thread::Queue.new
       @mutex.synchronize do
-        if @open_group
-          group = @open_group
-        else
-          group = @open_group = Group.new
-          leader = true
-        end
-        group.entries << execution.job_id
-        group.leader_cv.signal if !leader && target && group.entries.size >= target
+        ensure_flusher
+        batch = (@pending ||= Batch.new([], []))
+        batch.job_ids << execution.job_id
+        batch.waiters << waiter
+        @work_cv.signal
       end
 
-      if leader
-        batch = nil
-        @mutex.synchronize do
-          unless target && group.entries.size >= target
-            group.leader_cv.wait(@mutex, GATHER_WINDOW)
-          end
-          group.sealed = true
-          @open_group = nil if @open_group.equal?(group)
-          batch = group.entries.dup
-        end
-
-        error = nil
-        begin
-          flush(batch)
-        rescue => e
-          error = e
-        end
-
-        @mutex.synchronize do
-          group.done = true
-          group.error = error
-          group.cv.broadcast
-        end
-        raise error if error
-      else
-        @mutex.synchronize do
-          group.cv.wait(@mutex) until group.done
-        end
-        raise group.error if group.error
-      end
+      error = waiter.pop
+      raise error if error
     end
 
     private
+      def ensure_flusher
+        return if @flusher&.alive?
+
+        @flusher = Thread.new do
+          loop do
+            batch = nil
+            @mutex.synchronize do
+              @work_cv.wait(@mutex) while @pending.nil?
+              batch = @pending
+              @pending = nil
+            end
+
+            error = nil
+            begin
+              flush(batch.job_ids)
+            rescue => e
+              error = e
+            end
+
+            batch.waiters.each { |waiter| waiter.push(error) }
+          end
+        end
+        @flusher.name = "solid_queue_completion_flusher"
+      end
+
       def flush(job_ids)
-        if ClaimedExecution.connection.adapter_name == "PostgreSQL"
+        if ClaimedExecution.connection_pool.db_config.adapter == "postgresql"
           ids = job_ids.join(",")
-          ClaimedExecution.connection.exec_update(<<~SQL)
-            WITH deleted AS (
-              DELETE FROM solid_queue_claimed_executions WHERE job_id IN (#{ids}) RETURNING job_id
-            )
-            UPDATE solid_queue_jobs SET finished_at = now()
-            WHERE id IN (SELECT job_id FROM deleted)
-          SQL
+          ClaimedExecution.connection_pool.with_connection do |connection|
+            connection.exec_update(<<~SQL)
+              WITH deleted AS (
+                DELETE FROM solid_queue_claimed_executions WHERE job_id IN (#{ids}) RETURNING job_id
+              )
+              UPDATE solid_queue_jobs SET finished_at = now()
+              WHERE id IN (SELECT job_id FROM deleted)
+            SQL
+          end
         else
-          ClaimedExecution.transaction do
-            ClaimedExecution.where(job_id: job_ids).delete_all
-            Job.where(id: job_ids).update_all(finished_at: Time.current)
+          ids = job_ids.join(",")
+          ClaimedExecution.connection_pool.with_connection do |connection|
+            ClaimedExecution.transaction do
+              connection.execute("DELETE FROM solid_queue_claimed_executions WHERE job_id IN (#{ids})")
+              connection.execute("UPDATE solid_queue_jobs SET finished_at = #{connection.quote(Time.current)} WHERE id IN (#{ids})")
+            end
           end
         end
       end

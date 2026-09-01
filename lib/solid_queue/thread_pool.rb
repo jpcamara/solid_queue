@@ -12,9 +12,9 @@ module SolidQueue
       }
 
       def schedule(execution)
-        Concurrent::Promises.future_on(executor, execution) do |thread_execution|
+        executor.post(execution) do |thread_execution|
           perform_execution(thread_execution)
-        end.on_rejection! do |error|
+        rescue Exception => error
           # Backstop for errors raised outside perform_execution's own rescue,
           # such as when restoring capacity or waking up the worker
           handle_thread_error(error)
