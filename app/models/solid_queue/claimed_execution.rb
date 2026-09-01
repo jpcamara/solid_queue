@@ -99,7 +99,25 @@ class SolidQueue::ClaimedExecution < SolidQueue::Execution
     end
 
     def finished
-      finalize { job.finished! }
+      if single_statement_finish?
+        single_statement_finish
+      else
+        finalize { job.finished! }
+      end
+    end
+
+    # Plain jobs on PostgreSQL: no concurrency semaphore to release, no batch
+    # tracking, no preserve=false destroy — the finish collapses to one atomic
+    # statement with the claimed row's deletion as the ownership guard
+    def single_statement_finish?
+      self.class.connection.adapter_name == "PostgreSQL" &&
+        SolidQueue.preserve_finished_jobs? &&
+        job.concurrency_key.nil? &&
+        !(job.respond_to?(:batched?) && job.batched?)
+    end
+
+    def single_statement_finish
+      SolidQueue::CompletionCoordinator.finish(self)
     end
 
     def finalize

@@ -9,9 +9,60 @@ module SolidQueue
     class << self
       def claim(queue_list, limit, process_id)
         QueueSelector.new(queue_list, self).scoped_relations.flat_map do |queue_relation|
-          select_and_lock(queue_relation, process_id, limit).tap do |locked|
-            limit -= locked.size
+          if single_statement_claim_supported?
+            single_statement_claim(queue_relation, process_id, limit).tap do |locked|
+              limit -= locked.size
+            end
+          else
+            select_and_lock(queue_relation, process_id, limit).tap do |locked|
+              limit -= locked.size
+            end
           end
+        end
+      end
+
+      def single_statement_claim_supported?
+        connection.adapter_name == "PostgreSQL"
+      end
+
+      # The same rows, locks and atomicity as select_and_lock + claiming, in
+      # one statement: candidates are locked with SKIP LOCKED, moved into
+      # claimed executions and deleted from ready, with the job row hydrated
+      # alongside so execution doesn't need to load it
+      def single_statement_claim(queue_relation, process_id, limit)
+        return [] if limit <= 0
+
+        candidates_sql = queue_relation.ordered.limit(limit).non_blocking_lock.select(:id, :job_id).to_sql
+        sql = <<~SQL
+          WITH candidates AS (#{candidates_sql}),
+          deleted AS (
+            DELETE FROM solid_queue_ready_executions WHERE id IN (SELECT id FROM candidates)
+          ),
+          claimed AS (
+            INSERT INTO solid_queue_claimed_executions (job_id, process_id, created_at)
+            SELECT job_id, #{process_id ? connection.quote(process_id) : "NULL"}, now() FROM candidates
+            RETURNING id, job_id, process_id, created_at
+          )
+          SELECT claimed.id AS claimed_id, claimed.job_id AS claimed_job_id,
+                 claimed.process_id AS claimed_process_id, claimed.created_at AS claimed_created_at,
+                 jobs.*
+          FROM claimed INNER JOIN solid_queue_jobs jobs ON jobs.id = claimed.job_id
+        SQL
+
+        result = connection.select_all(sql)
+        job_columns = SolidQueue::Job.column_names
+        result.rows.map do |row|
+          attrs = result.columns.zip(row).to_h
+          execution = SolidQueue::ClaimedExecution.instantiate(
+            "id" => attrs["claimed_id"], "job_id" => attrs["claimed_job_id"],
+            "process_id" => attrs["claimed_process_id"], "created_at" => attrs["claimed_created_at"]
+          )
+          job = SolidQueue::Job.instantiate(attrs.slice(*job_columns))
+          execution.association(:job).target = job
+          execution
+        end.tap do |claimed|
+          SolidQueue.instrument(:claim, process_id: process_id, job_ids: claimed.map(&:job_id),
+            claimed_job_ids: claimed.map(&:job_id), size: claimed.size)
         end
       end
 
