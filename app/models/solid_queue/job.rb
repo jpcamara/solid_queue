@@ -72,11 +72,13 @@ module SolidQueue
         # transactions and rollbacks behave identically. Anything else (or an
         # unrecognized adapter) declines and takes the regular path.
         def single_statement_enqueue(active_job)
+          now = Time.now
           scheduled_at = active_job.scheduled_at
-          return nil if scheduled_at && scheduled_at > Time.current
+          return nil if scheduled_at && scheduled_at > now
           return nil if active_job.respond_to?(:concurrency_key) && active_job.concurrency_key
           return nil if active_job.respond_to?(:batch_id) && active_job.batch_id
 
+          now_string = fast_enqueue_timestamp(now)
           attributes = {
             "queue_name" => active_job.queue_name || DEFAULT_QUEUE_NAME,
             "class_name" => active_job.class.name,
@@ -88,18 +90,33 @@ module SolidQueue
 
           id = wrap_enqueue_errors do
             case connection.adapter_name
-            when "PostgreSQL" then pg_fast_enqueue(attributes)
-            when "SQLite" then sqlite_fast_enqueue(attributes)
-            when /mysql/i then mysql_fast_enqueue(attributes)
+            when "PostgreSQL" then pg_fast_enqueue(attributes, now_string)
+            when "SQLite" then sqlite_fast_enqueue(attributes, now_string)
+            when /mysql/i then mysql_fast_enqueue(attributes, now_string)
             end
           end
           return nil unless id
 
-          now = Time.current
           instantiate(attributes.merge(
             "id" => id, "finished_at" => nil, "concurrency_key" => nil,
-            "created_at" => now, "updated_at" => now
+            "created_at" => now_string, "updated_at" => now_string
           ))
+        end
+
+        # The database timestamp format Active Record uses, with the
+        # formatted prefix reused within the same second. A concurrently
+        # written cache entry is valid for its own second either way.
+        def fast_enqueue_timestamp(now)
+          utc = now.getutc
+          sec = utc.to_i
+          cached_sec, prefix = @fast_enqueue_ts_cache
+
+          unless sec == cached_sec
+            prefix = utc.strftime("%Y-%m-%d %H:%M:%S.")
+            @fast_enqueue_ts_cache = [ sec, prefix ].freeze
+          end
+
+          format("%s%06d", prefix, utc.usec)
         end
 
         PG_ENQUEUE_SQL = <<~SQL
@@ -116,7 +133,7 @@ module SolidQueue
         # Prepared once per connection and executed raw on the caller's own
         # connection: a single atomic statement that joins any open
         # transaction and autocommits durably otherwise
-        def pg_fast_enqueue(attributes)
+        def pg_fast_enqueue(attributes, now_string)
           conn = connection
           conn.materialize_transactions
           raw = conn.raw_connection
@@ -133,12 +150,12 @@ module SolidQueue
             attributes["priority"],
             attributes["active_job_id"],
             attributes["scheduled_at"] && conn.quoted_date(attributes["scheduled_at"]),
-            conn.quoted_date(Time.current)
+            now_string
           ])
           result.ntuples == 1 ? result.getvalue(0, 0).to_i : nil
         end
 
-        def sqlite_fast_enqueue(attributes)
+        def sqlite_fast_enqueue(attributes, now_string)
           conn = connection
           prepared = conn.instance_variable_get(:@sq_prepared_enqueue) || conn.instance_variable_set(:@sq_prepared_enqueue, {})
           job_stmt = prepared[:job] ||= conn.raw_connection.prepare(
@@ -150,7 +167,7 @@ module SolidQueue
           begin_stmt = prepared[:begin] ||= conn.raw_connection.prepare("BEGIN IMMEDIATE")
           commit_stmt = prepared[:commit] ||= conn.raw_connection.prepare("COMMIT")
 
-          now = conn.quoted_date(Time.current)
+          now = now_string
           scheduled = attributes["scheduled_at"] && conn.quoted_date(attributes["scheduled_at"])
           id = nil
           SolidQueue::SqliteWriterFunnel.acquire(connection_pool) do
@@ -189,13 +206,13 @@ module SolidQueue
 
         # One multi-statement round trip holding the same transaction; only
         # used outside caller transactions, which the regular path serves
-        def mysql_fast_enqueue(attributes)
+        def mysql_fast_enqueue(attributes, now_string)
           return nil if connection.transaction_open?
 
           fast_enqueue_mysql_mutex.synchronize do
             client = fast_enqueue_mysql_client
             begin
-              now = Time.current.utc.strftime("'%Y-%m-%d %H:%M:%S.%6N'")
+              now = "'#{now_string}'"
               scheduled = attributes["scheduled_at"] ? Time.at(attributes["scheduled_at"]).utc.strftime("'%Y-%m-%d %H:%M:%S.%6N'") : "NULL"
               q = "'#{client.escape(attributes["queue_name"])}'"
               result = client.query(<<~SQL)
