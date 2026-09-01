@@ -42,7 +42,7 @@ module SolidQueue
 
       waiter = nil
       @mutex.synchronize do
-        if @flushing >= MAX_INFLIGHT_FLUSHES
+        if @flushing >= max_inflight_flushes
           waiter = (Thread.current[:sq_completion_waiter] ||= Thread::Queue.new)
           my_batch = (@pending ||= Batch.new([], []))
           my_batch.job_ids << execution.job_id
@@ -77,18 +77,60 @@ module SolidQueue
     end
 
     private
-      # One flush in flight per process: concurrent leaders split arrivals
-      # into smaller batches, and measured throughput drops on every adapter
+      # In-flight flushes adapt to what commits cost. When commits are cheap
+      # (fast or write-cached fsync), one leader building large batches wins:
+      # concurrent leaders would only split arrivals. When commits are
+      # expensive (real FLUSH per fsync, milliseconds each), each leader
+      # first collects a window proportional to the flush cost — so batches
+      # stay whole — and just enough leaders run concurrently to keep a
+      # flush always in flight while the next batch collects. The database
+      # absorbs the overlapping commits into shared group commits.
+      # Measured on both cheap-fsync (macOS) and real-fsync (Linux consumer
+      # NVMe) hardware: extra concurrent flushes only split batches, because
+      # the database's commit path is a shared serial resource — throughput
+      # is fsync groups per second times jobs per group. One leader with a
+      # cost-scaled collect window maximizes jobs per group.
       MAX_INFLIGHT_FLUSHES = 1
+      CHEAP_FLUSH = 0.002
+
+      def max_inflight_flushes
+        MAX_INFLIGHT_FLUSHES
+      end
+
+      def collect_window_for(pace)
+        if pace < CHEAP_FLUSH
+          pace > 0.0012 ? 0.0012 : pace
+        else
+          half = pace / 2
+          half > 0.01 ? 0.01 : half
+        end
+      end
 
       # Group-commit collection: a fresh leader waits one flush-duration
       # (measured, not guessed) before flushing, so completions from the same
       # claim burst commit together instead of one commit each. Promoted
       # leaders flush back-to-back and their batches size themselves.
       def pace_and_collect(my_batch)
-        return unless @flush_pace > 0
+        pace = @flush_pace
+        return unless pace > 0
 
-        sleep(@flush_pace)
+        if pace < CHEAP_FLUSH
+          sleep(collect_window_for(pace))
+        else
+          # When flushes are expensive the whole in-flight burst should share
+          # one commit: keep collecting in 1ms slices while completions are
+          # still arriving, up to half the flush duration
+          deadline = ::Process.clock_gettime(::Process::CLOCK_MONOTONIC) + collect_window_for(pace)
+          last_size = -1
+          loop do
+            sleep(0.001)
+            size = @pending&.job_ids&.size || 0
+            break if size == last_size
+            last_size = size
+            break if ::Process.clock_gettime(::Process::CLOCK_MONOTONIC) >= deadline
+          end
+        end
+
         @mutex.synchronize do
           if (joined = @pending)
             @pending = nil
@@ -98,12 +140,9 @@ module SolidQueue
         end
       end
 
-      MAX_FLUSH_PACE = 0.0012
-
       def record_flush_pace(started, finished)
         duration = finished - started
-        pace = @flush_pace.zero? ? duration : @flush_pace * 0.8 + duration * 0.2
-        @flush_pace = pace > MAX_FLUSH_PACE ? MAX_FLUSH_PACE : pace
+        @flush_pace = @flush_pace.zero? ? duration : @flush_pace * 0.8 + duration * 0.2
       end
 
       # Single-writer databases do best with a single writer thread: pool
