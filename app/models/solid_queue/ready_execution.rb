@@ -80,7 +80,7 @@ module SolidQueue
         claim_mysql_mutex.synchronize do
           client = claim_mysql_client
           begin
-            result = client.query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED; BEGIN; #{select_sql}")
+            result = client.query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED; BEGIN; #{select_sql}", cache_rows: false)
             while client.next_result
               r = client.store_result
               result = r if r
@@ -91,13 +91,13 @@ module SolidQueue
               next []
             end
 
-            job_columns = SolidQueue::Job.column_names
             now = Time.current.utc.strftime("'%Y-%m-%d %H:%M:%S.%6N'")
             claimed = result.map do |attrs|
-              job = SolidQueue::Job.instantiate(attrs.slice(*job_columns))
+              ready_id = attrs.delete("ready_id")
+              job = SolidQueue::Job.instantiate(attrs)
               execution = SolidQueue::ClaimedExecution.instantiate_claimed(job_id: job.id, process_id: process_id)
               execution.association(:job).target = job
-              [ attrs["ready_id"], execution ]
+              [ ready_id, execution ]
             end
 
             values = claimed.map { |_, e| "(#{e.job_id}, #{process_id ? process_id.to_i : "NULL"}, #{now})" }.join(",")
@@ -152,13 +152,13 @@ module SolidQueue
         rows = select_stmt.execute(limit.to_i).to_a
         return [] if rows.empty?
 
-        job_columns = SolidQueue::Job.column_names
         claimed = rows.map do |row|
           attrs = row.is_a?(Hash) ? row : columns.zip(row).to_h
-          job = SolidQueue::Job.instantiate(attrs.slice(*job_columns))
+          ready_id = attrs.delete("ready_id")
+          job = SolidQueue::Job.instantiate(attrs)
           execution = SolidQueue::ClaimedExecution.instantiate_claimed(job_id: job.id, process_id: process_id)
           execution.association(:job).target = job
-          [ attrs["ready_id"], execution ]
+          [ ready_id, execution ]
         end
 
         insert_stmt = sqlite_prepared("claim_insert") do

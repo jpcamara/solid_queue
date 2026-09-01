@@ -23,6 +23,10 @@ module SolidQueue
       @mutex = Mutex.new
       @work_cv = ConditionVariable.new
       @pending = nil
+      @flushing = 0
+      @pool_mutex = Mutex.new
+      @flusher_pool = Thread::Queue.new
+      @flusher_pool_size = 0
       @flush_pace = 0.0
     end
 
@@ -38,13 +42,13 @@ module SolidQueue
 
       waiter = nil
       @mutex.synchronize do
-        if @flushing
+        if @flushing >= MAX_INFLIGHT_FLUSHES
           waiter = (Thread.current[:sq_completion_waiter] ||= Thread::Queue.new)
           my_batch = (@pending ||= Batch.new([], []))
           my_batch.job_ids << execution.job_id
           my_batch.waiters << waiter
         else
-          @flushing = true
+          @flushing += 1
           lead = true
           my_batch = Batch.new([ execution.job_id ], [])
           pending = @pending
@@ -73,6 +77,10 @@ module SolidQueue
     end
 
     private
+      # One flush in flight per process: concurrent leaders split arrivals
+      # into smaller batches, and measured throughput drops on every adapter
+      MAX_INFLIGHT_FLUSHES = 1
+
       # Group-commit collection: a fresh leader waits one flush-duration
       # (measured, not guessed) before flushing, so completions from the same
       # claim burst commit together instead of one commit each. Promoted
@@ -90,7 +98,7 @@ module SolidQueue
         end
       end
 
-      MAX_FLUSH_PACE = 0.0007
+      MAX_FLUSH_PACE = 0.0012
 
       def record_flush_pace(started, finished)
         duration = finished - started
@@ -154,7 +162,7 @@ module SolidQueue
         @mutex.synchronize do
           next_batch = @pending
           @pending = nil
-          @flushing = false if next_batch.nil?
+          @flushing -= 1 if next_batch.nil?
         end
         next_batch.waiters.shift.push(next_batch) if next_batch
 
@@ -162,31 +170,34 @@ module SolidQueue
         error
       end
 
-      # The flusher owns one connection for its whole life: no pool checkout
-      # per flush, and on MySQL a multi-statement client sends the entire
-      # atomic flush in a single round trip
+      # Flushers own persistent raw connections, one per in-flight flush: no
+      # pool checkout per flush, and on MySQL a multi-statement client sends
+      # the entire atomic flush in a single round trip
       def flush(job_ids)
         ids = job_ids.join(",")
 
         case adapter
         when :postgresql
-          flusher_ar_connection.exec_update(<<~SQL)
-            WITH deleted AS (
-              DELETE FROM solid_queue_claimed_executions WHERE job_id IN (#{ids}) RETURNING job_id
-            )
-            UPDATE solid_queue_jobs SET finished_at = now()
-            WHERE id IN (SELECT job_id FROM deleted)
-          SQL
+          with_flusher_connection do |conn|
+            conn.exec(<<~SQL)
+              WITH deleted AS (
+                DELETE FROM solid_queue_claimed_executions WHERE job_id IN (#{ids}) RETURNING job_id
+              )
+              UPDATE solid_queue_jobs SET finished_at = now()
+              WHERE id IN (SELECT job_id FROM deleted)
+            SQL
+          end
         when :mysql
           now = Time.current.utc.strftime("'%Y-%m-%d %H:%M:%S.%6N'")
-          client = flusher_mysql_client
-          client.query(<<~SQL)
-            BEGIN;
-            DELETE FROM solid_queue_claimed_executions WHERE job_id IN (#{ids});
-            UPDATE solid_queue_jobs SET finished_at = #{now} WHERE id IN (#{ids});
-            COMMIT
-          SQL
-          client.next_result while client.next_result
+          with_flusher_connection do |client|
+            client.query(<<~SQL)
+              BEGIN;
+              DELETE FROM solid_queue_claimed_executions WHERE job_id IN (#{ids});
+              UPDATE solid_queue_jobs SET finished_at = #{now} WHERE id IN (#{ids});
+              COMMIT
+            SQL
+            client.next_result while client.next_result
+          end
         else
           connection = flusher_ar_connection
           @sqlite_delete_stmt ||= connection.raw_connection.prepare("DELETE FROM solid_queue_claimed_executions WHERE job_id IN (SELECT value FROM json_each(?))")
@@ -214,9 +225,29 @@ module SolidQueue
         @flusher_ar_connection ||= ClaimedExecution.connection_pool.checkout
       end
 
-      def flusher_mysql_client
-        @flusher_mysql_client ||= begin
-          config = ClaimedExecution.connection_pool.db_config.configuration_hash
+      def with_flusher_connection
+        conn = nil
+        @pool_mutex.synchronize do
+          if @flusher_pool.empty? && @flusher_pool_size < MAX_INFLIGHT_FLUSHES
+            @flusher_pool_size += 1
+            conn = new_flusher_connection
+          end
+        end
+        conn ||= @flusher_pool.pop
+        begin
+          yield conn
+        ensure
+          @flusher_pool.push(conn)
+        end
+      end
+
+      def new_flusher_connection
+        config = ClaimedExecution.connection_pool.db_config.configuration_hash
+
+        if adapter == :postgresql
+          PG.connect({ dbname: config[:database], host: config[:host], port: config[:port],
+                       user: config[:username], password: config[:password] }.compact)
+        else
           Mysql2::Client.new(config.merge(flags: Mysql2::Client::MULTI_STATEMENTS))
         end
       end
