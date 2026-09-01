@@ -56,6 +56,10 @@ module SolidQueue
         return [] if limit <= 0
 
         conditions = queue_relation.where_clause.any? ? "WHERE #{queue_relation.where_clause.ast.to_sql}" : ""
+        # Same row locks on the rows we take; READ COMMITTED skips the gap
+        # locks REPEATABLE READ adds to the ordered range scan, which serialize
+        # concurrent claimers against enqueuers on the index head
+        connection.execute("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
         transaction do
           result = connection.select_all(<<~SQL)
             SELECT re.id AS ready_id, jobs.*
@@ -113,10 +117,12 @@ module SolidQueue
           [ attrs["ready_id"], execution ]
         end
 
-        transaction do
-          values = claimed.map { |_, e| "(#{e.job_id}, #{process_id ? connection.quote(process_id) : "NULL"}, #{now})" }.join(",")
-          connection.execute("INSERT INTO solid_queue_claimed_executions (job_id, process_id, created_at) VALUES #{values}")
-          connection.execute("DELETE FROM solid_queue_ready_executions WHERE id IN (#{claimed.map(&:first).join(",")})")
+        SolidQueue::SqliteWriterFunnel.acquire(connection_pool) do
+          transaction do
+            values = claimed.map { |_, e| "(#{e.job_id}, #{process_id ? connection.quote(process_id) : "NULL"}, #{now})" }.join(",")
+            connection.execute("INSERT INTO solid_queue_claimed_executions (job_id, process_id, created_at) VALUES #{values}")
+            connection.execute("DELETE FROM solid_queue_ready_executions WHERE id IN (#{claimed.map(&:first).join(",")})")
+          end
         end
 
         claimed.map(&:last).tap do |executions|
