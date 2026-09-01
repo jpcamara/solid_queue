@@ -35,7 +35,8 @@ module SolidQueue
       def enqueue(active_job, scheduled_at: Time.current)
         active_job.scheduled_at = scheduled_at
 
-        create_from_active_job(active_job).tap do |enqueued_job|
+        job = single_statement_enqueue(active_job) || create_from_active_job(active_job)
+        job.tap do |enqueued_job|
           active_job.provider_job_id = enqueued_job.id if enqueued_job.persisted?
           active_job.successfully_enqueued = enqueued_job.persisted?
         end
@@ -46,12 +47,189 @@ module SolidQueue
         DEFAULT_QUEUE_NAME = "default"
 
         def create_from_active_job(active_job)
-          create!(**attributes_from_active_job(active_job))
-        rescue ActiveRecord::ActiveRecordError => e
+          wrap_enqueue_errors do
+            create!(**attributes_from_active_job(active_job))
+          end
+        end
+
+        def wrap_enqueue_errors
+          yield
+        rescue => e
+          raise unless e.is_a?(ActiveRecord::ActiveRecordError) ||
+            (defined?(SQLite3::Exception) && e.is_a?(SQLite3::Exception)) ||
+            (defined?(Mysql2::Error) && e.is_a?(Mysql2::Error)) ||
+            (defined?(PG::Error) && e.is_a?(PG::Error))
+
           enqueue_error = EnqueueError.new("#{e.class.name}: #{e.message}").tap do |error|
             error.set_backtrace e.backtrace
           end
           raise enqueue_error
+        end
+
+        # A plain, immediate, unbatched job becomes exactly the same two rows
+        # the regular path creates, written in one transaction without model
+        # ceremony — on the caller's own connection, so surrounding
+        # transactions and rollbacks behave identically. Anything else (or an
+        # unrecognized adapter) declines and takes the regular path.
+        def single_statement_enqueue(active_job)
+          scheduled_at = active_job.scheduled_at
+          return nil if scheduled_at && scheduled_at > Time.current
+          return nil if active_job.respond_to?(:concurrency_key) && active_job.concurrency_key
+          return nil if active_job.respond_to?(:batch_id) && active_job.batch_id
+
+          attributes = {
+            "queue_name" => active_job.queue_name || DEFAULT_QUEUE_NAME,
+            "class_name" => active_job.class.name,
+            "arguments" => JSON.dump(active_job.serialize),
+            "priority" => active_job.priority || DEFAULT_PRIORITY,
+            "active_job_id" => active_job.job_id,
+            "scheduled_at" => scheduled_at
+          }
+
+          id = wrap_enqueue_errors do
+            case connection.adapter_name
+            when "PostgreSQL" then pg_fast_enqueue(attributes)
+            when "SQLite" then sqlite_fast_enqueue(attributes)
+            when /mysql/i then mysql_fast_enqueue(attributes)
+            end
+          end
+          return nil unless id
+
+          now = Time.current
+          instantiate(attributes.merge(
+            "id" => id, "finished_at" => nil, "concurrency_key" => nil,
+            "created_at" => now, "updated_at" => now
+          ))
+        end
+
+        PG_ENQUEUE_SQL = <<~SQL
+          WITH job AS (
+            INSERT INTO solid_queue_jobs (queue_name, class_name, arguments, priority, active_job_id, scheduled_at, created_at, updated_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $7)
+            RETURNING id
+          )
+          INSERT INTO solid_queue_ready_executions (job_id, queue_name, priority, created_at)
+          SELECT id, $1, $4, $7 FROM job
+          RETURNING job_id
+        SQL
+
+        # Prepared once per connection and executed raw on the caller's own
+        # connection: a single atomic statement that joins any open
+        # transaction and autocommits durably otherwise
+        def pg_fast_enqueue(attributes)
+          conn = connection
+          conn.materialize_transactions
+          raw = conn.raw_connection
+
+          unless conn.instance_variable_get(:@sq_enqueue_prepared)
+            raw.prepare("sq_fast_enqueue", PG_ENQUEUE_SQL)
+            conn.instance_variable_set(:@sq_enqueue_prepared, true)
+          end
+
+          result = raw.exec_prepared("sq_fast_enqueue", [
+            attributes["queue_name"],
+            attributes["class_name"],
+            attributes["arguments"],
+            attributes["priority"],
+            attributes["active_job_id"],
+            attributes["scheduled_at"] && conn.quoted_date(attributes["scheduled_at"]),
+            conn.quoted_date(Time.current)
+          ])
+          result.ntuples == 1 ? result.getvalue(0, 0).to_i : nil
+        end
+
+        def sqlite_fast_enqueue(attributes)
+          conn = connection
+          prepared = conn.instance_variable_get(:@sq_prepared_enqueue) || conn.instance_variable_set(:@sq_prepared_enqueue, {})
+          job_stmt = prepared[:job] ||= conn.raw_connection.prepare(
+            "INSERT INTO solid_queue_jobs (queue_name, class_name, arguments, priority, active_job_id, scheduled_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+          )
+          ready_stmt = prepared[:ready] ||= conn.raw_connection.prepare(
+            "INSERT INTO solid_queue_ready_executions (job_id, queue_name, priority, created_at) VALUES (?, ?, ?, ?)"
+          )
+          begin_stmt = prepared[:begin] ||= conn.raw_connection.prepare("BEGIN IMMEDIATE")
+          commit_stmt = prepared[:commit] ||= conn.raw_connection.prepare("COMMIT")
+
+          now = conn.quoted_date(Time.current)
+          scheduled = attributes["scheduled_at"] && conn.quoted_date(attributes["scheduled_at"])
+          id = nil
+          SolidQueue::SqliteWriterFunnel.acquire(connection_pool) do
+            if conn.transaction_open?
+              transaction do
+                # Raw statements bypass Active Record, which otherwise defers
+                # BEGIN until its own first statement — materialize so these
+                # writes are inside the transaction they appear to be in
+                conn.materialize_transactions
+                id = sqlite_fast_insert(conn, job_stmt, ready_stmt, attributes, scheduled, now)
+              end
+            else
+              raw = conn.raw_connection
+              begin
+                begin_stmt.execute
+                id = sqlite_fast_insert(conn, job_stmt, ready_stmt, attributes, scheduled, now)
+                commit_stmt.execute
+              rescue Exception
+                begin raw.execute("ROLLBACK"); rescue SQLite3::Exception; end
+                raise
+              end
+            end
+          end
+          id
+        end
+
+        def sqlite_fast_insert(conn, job_stmt, ready_stmt, attributes, scheduled, now)
+          job_stmt.execute(
+            attributes["queue_name"], attributes["class_name"], attributes["arguments"],
+            attributes["priority"], attributes["active_job_id"], scheduled, now, now
+          ).to_a
+          id = conn.raw_connection.last_insert_row_id
+          ready_stmt.execute(id, attributes["queue_name"], attributes["priority"], now).to_a
+          id
+        end
+
+        # One multi-statement round trip holding the same transaction; only
+        # used outside caller transactions, which the regular path serves
+        def mysql_fast_enqueue(attributes)
+          return nil if connection.transaction_open?
+
+          fast_enqueue_mysql_mutex.synchronize do
+            client = fast_enqueue_mysql_client
+            begin
+              now = Time.current.utc.strftime("'%Y-%m-%d %H:%M:%S.%6N'")
+              scheduled = attributes["scheduled_at"] ? Time.at(attributes["scheduled_at"]).utc.strftime("'%Y-%m-%d %H:%M:%S.%6N'") : "NULL"
+              q = "'#{client.escape(attributes["queue_name"])}'"
+              result = client.query(<<~SQL)
+                BEGIN;
+                INSERT INTO solid_queue_jobs (queue_name, class_name, arguments, priority, active_job_id, scheduled_at, created_at, updated_at)
+                VALUES (#{q}, '#{client.escape(attributes["class_name"])}', '#{client.escape(attributes["arguments"])}',
+                        #{attributes["priority"].to_i}, '#{client.escape(attributes["active_job_id"])}', #{scheduled}, #{now}, #{now});
+                SET @sq_jid = LAST_INSERT_ID();
+                INSERT INTO solid_queue_ready_executions (job_id, queue_name, priority, created_at)
+                VALUES (@sq_jid, #{q}, #{attributes["priority"].to_i}, #{now});
+                COMMIT;
+                SELECT @sq_jid
+              SQL
+              while client.next_result
+                r = client.store_result
+                result = r if r
+              end
+              result&.first&.values&.first
+            rescue Mysql2::Error => e
+              begin client.query("ROLLBACK"); rescue Mysql2::Error; @fast_enqueue_mysql_client = nil; end
+              raise EnqueueError.new("#{e.class.name}: #{e.message}").tap { |err| err.set_backtrace(e.backtrace) }
+            end
+          end
+        end
+
+        def fast_enqueue_mysql_mutex
+          @fast_enqueue_mysql_mutex ||= Mutex.new
+        end
+
+        def fast_enqueue_mysql_client
+          @fast_enqueue_mysql_client ||= begin
+            config = connection_pool.db_config.configuration_hash
+            Mysql2::Client.new(config.merge(flags: Mysql2::Client::MULTI_STATEMENTS))
+          end
         end
 
         def create_all_from_active_jobs(active_jobs)
