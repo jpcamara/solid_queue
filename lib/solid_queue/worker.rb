@@ -24,6 +24,8 @@ module SolidQueue
         size: execution_pool_size,
         on_idle: -> { wake_up }
 
+      SolidQueue::CompletionCoordinator.target_group_size = execution_pool_size
+
       super(**options)
     end
 

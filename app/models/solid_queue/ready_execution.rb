@@ -16,9 +16,17 @@ module SolidQueue
           else
             select_and_lock(queue_relation, process_id, limit).tap do |locked|
               limit -= locked.size
+              preload_jobs(locked)
             end
           end
         end
+      end
+
+      def preload_jobs(claimed)
+        return if claimed.empty?
+
+        jobs_by_id = SolidQueue::Job.where(id: claimed.map(&:job_id)).index_by(&:id)
+        claimed.each { |execution| execution.association(:job).target = jobs_by_id[execution.job_id] }
       end
 
       def single_statement_claim_supported?

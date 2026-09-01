@@ -12,12 +12,18 @@ class SolidQueue::ClaimedExecution < SolidQueue::Execution
   end
 
   class << self
+    # Claimed rows are identified by their unique job_id, so instances built
+    # from the data just inserted work without reloading generated ids
+    def instantiate_claimed(data)
+      instantiate(data.transform_keys(&:to_s).merge("id" => nil, "created_at" => Time.current))
+    end
+
     def claiming(job_ids, process_id, &block)
       job_data = Array(job_ids).collect { |job_id| { job_id: job_id, process_id: process_id } }
 
       SolidQueue.instrument(:claim, process_id: process_id, job_ids: job_ids) do |payload|
         insert_all!(job_data)
-        where(job_id: job_ids, process_id: process_id).load.tap do |claimed|
+        job_data.map { |data| instantiate_claimed(data) }.tap do |claimed|
           block.call(claimed)
 
           payload[:size] = claimed.size
@@ -77,7 +83,6 @@ class SolidQueue::ClaimedExecution < SolidQueue::Execution
     SolidQueue.instrument(:release_claimed, job_id: job.id, process_id: process_id) do
       unless_already_finalized do
         job.dispatch_bypassing_concurrency_limits
-        destroy!
       end
     end
   end
@@ -110,8 +115,7 @@ class SolidQueue::ClaimedExecution < SolidQueue::Execution
     # tracking, no preserve=false destroy — the finish collapses to one atomic
     # statement with the claimed row's deletion as the ownership guard
     def single_statement_finish?
-      self.class.connection.adapter_name == "PostgreSQL" &&
-        SolidQueue.preserve_finished_jobs? &&
+      SolidQueue.preserve_finished_jobs? &&
         job.concurrency_key.nil? &&
         !(job.respond_to?(:batched?) && job.batched?)
     end
@@ -123,7 +127,6 @@ class SolidQueue::ClaimedExecution < SolidQueue::Execution
     def finalize
       finalized = unless_already_finalized do
         yield
-        destroy!
         true
       end
 
@@ -136,7 +139,7 @@ class SolidQueue::ClaimedExecution < SolidQueue::Execution
 
     def unless_already_finalized
       transaction do
-        return false unless self.class.unscoped.lock.find_by(id: id)
+        return false unless self.class.unscoped.where(job_id: job_id).delete_all == 1
 
         yield
       end

@@ -12,15 +12,23 @@ module SolidQueue
     GATHER_WINDOW = 0.0003
 
     class Group
-      attr_reader :entries, :cv
-      attr_accessor :done, :error
+      attr_reader :entries, :cv, :leader_cv
+      attr_accessor :done, :error, :sealed
 
       def initialize
         @entries = []
         @cv = ConditionVariable.new
+        @leader_cv = ConditionVariable.new
         @done = false
+        @sealed = false
         @error = nil
       end
+    end
+
+    class << self
+      # Hint from the worker: a group this large has everyone on board, so its
+      # leader can flush without waiting out the gather window
+      attr_accessor :target_group_size
     end
 
     class << self
@@ -40,6 +48,7 @@ module SolidQueue
       group = nil
       leader = false
 
+      target = self.class.target_group_size
       @mutex.synchronize do
         if @open_group
           group = @open_group
@@ -47,14 +56,17 @@ module SolidQueue
           group = @open_group = Group.new
           leader = true
         end
-        group.entries << [ execution.id, execution.job_id ]
+        group.entries << execution.job_id
+        group.leader_cv.signal if !leader && target && group.entries.size >= target
       end
 
       if leader
-        sleep GATHER_WINDOW
-
         batch = nil
         @mutex.synchronize do
+          unless target && group.entries.size >= target
+            group.leader_cv.wait(@mutex, GATHER_WINDOW)
+          end
+          group.sealed = true
           @open_group = nil if @open_group.equal?(group)
           batch = group.entries.dup
         end
@@ -81,15 +93,22 @@ module SolidQueue
     end
 
     private
-      def flush(batch)
-        execution_ids = batch.map(&:first).join(",")
-        ClaimedExecution.connection.exec_update(<<~SQL)
-          WITH deleted AS (
-            DELETE FROM solid_queue_claimed_executions WHERE id IN (#{execution_ids}) RETURNING job_id
-          )
-          UPDATE solid_queue_jobs SET finished_at = now()
-          WHERE id IN (SELECT job_id FROM deleted)
-        SQL
+      def flush(job_ids)
+        if ClaimedExecution.connection.adapter_name == "PostgreSQL"
+          ids = job_ids.join(",")
+          ClaimedExecution.connection.exec_update(<<~SQL)
+            WITH deleted AS (
+              DELETE FROM solid_queue_claimed_executions WHERE job_id IN (#{ids}) RETURNING job_id
+            )
+            UPDATE solid_queue_jobs SET finished_at = now()
+            WHERE id IN (SELECT job_id FROM deleted)
+          SQL
+        else
+          ClaimedExecution.transaction do
+            ClaimedExecution.where(job_id: job_ids).delete_all
+            Job.where(id: job_ids).update_all(finished_at: Time.current)
+          end
+        end
       end
   end
 end
