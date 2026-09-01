@@ -13,7 +13,9 @@ module SolidQueue
     def initialize(size, on_idle: nil)
       @size = size
       @on_idle = on_idle
-      @available_capacity = size
+      # Admit up to a queue's worth beyond running threads so pool threads
+      # pull queued work immediately instead of waiting on a poller wake
+      @available_capacity = size * 2
       @mutex = Mutex.new
     end
 
@@ -66,7 +68,9 @@ module SolidQueue
       def restore_capacity
         should_notify = mutex.synchronize do
           @available_capacity += 1
-          @available_capacity.positive?
+          # Wake the poller in batches, not per completion: refilling half the
+          # admission window at a time keeps threads fed with far fewer wakes
+          @available_capacity >= size
         end
 
         on_idle&.call if should_notify

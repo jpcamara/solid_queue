@@ -77,7 +77,6 @@ class SolidQueue::ClaimedExecution < SolidQueue::Execution
     SolidQueue.instrument(:release_claimed, job_id: job.id, process_id: process_id) do
       unless_already_finalized do
         job.dispatch_bypassing_concurrency_limits
-        destroy!
       end
     end
   end
@@ -99,13 +98,22 @@ class SolidQueue::ClaimedExecution < SolidQueue::Execution
     end
 
     def finished
-      finalize { job.finished! }
+      if buffer_completion?
+        SolidQueue::CompletionBuffer.add(self)
+      else
+        finalize { job.finished! }
+      end
+    end
+
+    # Plain jobs only: everything with finalization side effects keeps the
+    # per-job path
+    def buffer_completion?
+      job.concurrency_key.nil? && !(job.respond_to?(:batched?) && job.batched?)
     end
 
     def finalize
       finalized = unless_already_finalized do
         yield
-        destroy!
         true
       end
 
@@ -118,7 +126,7 @@ class SolidQueue::ClaimedExecution < SolidQueue::Execution
 
     def unless_already_finalized
       transaction do
-        return false unless self.class.unscoped.lock.find_by(id: id)
+        return false unless self.class.unscoped.delete(id) == 1
 
         yield
       end

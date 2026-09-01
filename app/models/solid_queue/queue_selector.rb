@@ -70,7 +70,21 @@ module SolidQueue
       end
 
       def paused_queues
-        @paused_queues ||= Pause.all.pluck(:queue_name)
+        @paused_queues ||= self.class.cached_paused_queues
+      end
+
+      # Pause checks run on every poll; pausing is a human-scale action, so a
+      # short cache keeps the poll loop off the pauses table
+      PAUSE_CACHE_TTL = 1.0
+
+      def self.cached_paused_queues
+        now = ::Process.clock_gettime(::Process::CLOCK_MONOTONIC)
+        cached = @paused_cache
+        return cached[1] if cached && cached[0] > now
+
+        Pause.all.pluck(:queue_name).tap do |names|
+          @paused_cache = [ now + PAUSE_CACHE_TTL, names ]
+        end
       end
 
       def in_raw_order(queues)

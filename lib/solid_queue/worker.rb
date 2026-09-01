@@ -32,31 +32,47 @@ module SolidQueue
     end
 
     private
-      def poll
-        claim_executions.then do |executions|
-          executions.each do |execution|
-            pool.post(execution)
-          end
+      # Claim more than the pool can run at once: claimed rows are this
+      # worker's either way (crash recovery releases them), and deeper claim
+      # batches amortize the claim transaction across more jobs
+      PREFETCH_FACTOR = 50
 
-          pool.idle? ? polling_interval : 10.minutes
+      def poll
+        @backlog ||= []
+        @backlog.concat(claim_executions) if @backlog.empty?
+
+        while pool.available_capacity > 0 && (execution = @backlog.shift)
+          pool.post(execution)
         end
+
+        # Nothing claimed and nothing running: don't sit on buffered completions
+        SolidQueue::CompletionBuffer.flush if @backlog.empty? && pool.idle?
+
+        pool.idle? ? polling_interval : 10.minutes
       end
 
       def claim_executions
         with_polling_volume do
-          SolidQueue::ReadyExecution.claim(queues, pool.available_capacity, process_id)
+          SolidQueue::ReadyExecution.claim(queues, pool.size * PREFETCH_FACTOR, process_id).tap do |executions|
+            # Load jobs in one query, outside the claim transaction so the
+            # locked section stays as short as possible
+            ActiveRecord::Associations::Preloader.new(records: executions, associations: :job).call if executions.any?
+          end
         end
       end
 
       def shutdown
         pool.shutdown
         pool.wait_for_termination(SolidQueue.shutdown_timeout)
+        # Flush buffered completions after the pool stops adding to them and
+        # before deregistration releases this worker's remaining claims
+        wrap_in_app_executor { SolidQueue::CompletionBuffer.flush }
 
         super
       end
 
       def all_work_completed?
-        SolidQueue::ReadyExecution.aggregated_count_across(queues).zero?
+        (@backlog.nil? || @backlog.empty?) && SolidQueue::ReadyExecution.aggregated_count_across(queues).zero?
       end
 
       def set_procline
