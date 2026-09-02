@@ -42,12 +42,6 @@ module SolidQueue
       def flush_completions(job_ids)
         serialize_writes { super }
       end
-
-      def insert_jobs_returning_ids(job_rows)
-        Job.insert_all!(job_rows)
-        last = Job.connection.select_value("SELECT last_insert_rowid()").to_i
-        ((last - job_rows.size + 1)..last).to_a
-      end
     end
   end
 end

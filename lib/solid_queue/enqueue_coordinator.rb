@@ -7,8 +7,10 @@ module SolidQueue
   # are expensive: concurrent enqueuers share one batched insert transaction,
   # each returning only after that durable commit lands. The first arrival
   # leads, collects for a window scaled to the measured commit cost, and
-  # writes every collected job in a single round trip. A failed batch is
-  # retried entry by entry so each error reaches the caller that owns it.
+  # writes every collected job in one durable write; whoever accumulated
+  # meanwhile is promoted to lead the next batch. A lone serial caller
+  # skips the window, since nobody would join it. A failed batch is retried
+  # entry by entry so each error reaches the caller that owns it.
   class EnqueueCoordinator
     include Singleton
 
@@ -25,6 +27,9 @@ module SolidQueue
       # Racy reads by design: any recently committed batch's duration is a
       # valid pace, so an atomic reference is all the synchronization needed
       @pace = Concurrent::AtomicReference.new(0.0)
+      # The context that led the last batch alone with nobody behind it;
+      # that same context leading again is a serial caller
+      @solo_leader = Concurrent::AtomicReference.new(nil)
     end
 
     def enqueue(attributes, scheduled)
@@ -46,17 +51,13 @@ module SolidQueue
 
       if lead
         collect_burst
-        entries = nil
-        @mutex.synchronize do
-          entries = @pending || []
-          @pending = nil
-        end
-        entries.unshift(entry)
-        lead_entries(entries)
+        lead_entries(take_pending.unshift(entry))
       else
         result = entry.waiter.pop
         case result
-        when Array then lead_entries(result) # promoted: our entry is first
+        when Array # promoted: our entry is first
+          collect_burst
+          lead_entries(result.concat(take_pending))
         when Exception then raise result
         else result
         end
@@ -66,9 +67,25 @@ module SolidQueue
     private
       CHEAP_COMMIT = 0.002
 
+      def take_pending
+        @mutex.synchronize do
+          taken = @pending || []
+          @pending = nil
+          taken
+        end
+      end
+
+      # Every leader on an expensive commit, promoted or not, lets the burst
+      # gather before writing: a promoted leader that wrote at once would
+      # keep meeting the threads its predecessor released in the next batch,
+      # splitting one burst into two commits forever
       def collect_burst
         pace = @pace.get
         return if pace < CHEAP_COMMIT
+        # A serial caller is the same context leading solo batches back to
+        # back; for it the window would be pure latency with nobody to
+        # collect. Any other leader, or anyone already pending, waits.
+        return if @pending.nil? && @solo_leader.get == ActiveSupport::IsolatedExecutionState.context
 
         window = pace / 2
         window = 0.01 if window > 0.01
@@ -106,6 +123,7 @@ module SolidQueue
           @pending = nil
           @leading = false if next_entries.nil?
         end
+        @solo_leader.set(entries.size == 1 && next_entries.nil? ? ActiveSupport::IsolatedExecutionState.context : nil)
         next_entries.first.waiter.push(next_entries) if next_entries
 
         if error
@@ -130,12 +148,8 @@ module SolidQueue
         e
       end
 
-      # One transaction per batch, written with Active Record's bulk API on
-      # a briefly checked-out connection. A single multi-row insert receives
-      # consecutive auto-increment ids on MySQL (simple inserts allocate in
-      # one chunk in every autoinc lock mode) and consecutive rowids on
-      # SQLite (single writer), so the whole batch's ids follow from one
-      # value; PostgreSQL simply returns them.
+      # One durable write per batch on a briefly checked-out connection; the
+      # adapter decides the statements, the coordinator only shapes rows
       def write_batch(entries)
         now = Time.current
         job_rows = entries.map do |entry|
@@ -147,23 +161,12 @@ module SolidQueue
         end
 
         Job.connection_pool.with_connection do
-          adapter.serialize_writes { insert_batch(entries, job_rows, now) }
+          adapter.serialize_writes { adapter.write_enqueue_batch(job_rows, now) }
         end
       end
 
       def adapter
         @adapter ||= DatabaseAdapter.resolve
-      end
-
-      def insert_batch(entries, job_rows, now)
-        Job.transaction do
-          ids = adapter.insert_jobs_returning_ids(job_rows)
-          ReadyExecution.insert_all!(entries.each_index.map { |i|
-            { job_id: ids[i], queue_name: job_rows[i][:queue_name],
-              priority: job_rows[i][:priority], created_at: now }
-          })
-          ids
-        end
       end
   end
 end

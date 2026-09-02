@@ -52,9 +52,23 @@ module SolidQueue
       end
     end
 
-    # Bulk-inserts job rows and returns their new ids, in order
+    # Writes a batch of jobs and their ready executions in one transaction,
+    # returning the new job ids in row order
+    def write_enqueue_batch(job_rows, now)
+      Job.transaction do
+        ids = insert_jobs_returning_ids(job_rows)
+        ReadyExecution.insert_all!(job_rows.each_with_index.map { |row, i|
+          { job_id: ids[i], queue_name: row[:queue_name], priority: row[:priority], created_at: now }
+        })
+        ids
+      end
+    end
+
+    # Bulk-inserts job rows and returns their new ids in row order. A single
+    # multi-row insert draws its ids in row order, so ascending ids are the
+    # rows' order whatever order RETURNING reports them in.
     def insert_jobs_returning_ids(job_rows)
-      raise NotImplementedError
+      Job.insert_all!(job_rows, returning: [ :id ]).rows.map(&:first).sort
     end
 
     private

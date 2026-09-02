@@ -51,8 +51,28 @@ module SolidQueue
         SQL
       end
 
-      def insert_jobs_returning_ids(job_rows)
-        Job.insert_all!(job_rows, returning: [ :id ]).rows.map(&:first)
+      # One atomic statement, one round trip, one implicit commit: the job
+      # rows and their ready executions land together, so a serial caller
+      # pays for the commit and little else
+      def write_enqueue_batch(job_rows, now)
+        connection = Job.connection
+        arguments_type = Job.type_for_attribute("arguments")
+        values = job_rows.map do |row|
+          [ row[:queue_name], row[:class_name], arguments_type.serialize(row[:arguments]), row[:priority],
+            row[:active_job_id], row[:scheduled_at], now, now ].map { |value| connection.quote(value) }.join(", ")
+        end
+
+        connection.select_values(<<~SQL)
+          WITH jobs AS (
+            INSERT INTO solid_queue_jobs (queue_name, class_name, arguments, priority, active_job_id, scheduled_at, created_at, updated_at)
+            VALUES (#{values.join("), (")})
+            RETURNING id, queue_name, priority, created_at
+          ), ready AS (
+            INSERT INTO solid_queue_ready_executions (job_id, queue_name, priority, created_at)
+            SELECT id, queue_name, priority, created_at FROM jobs
+          )
+          SELECT id FROM jobs ORDER BY id
+        SQL
       end
     end
   end
