@@ -205,11 +205,15 @@ module SolidQueue
         end
 
         # One multi-statement round trip holding the same transaction; only
-        # used outside caller transactions, which the regular path serves
+        # used outside caller transactions, which the regular path serves.
+        # Each thread owns its client: concurrent enqueuers must commit
+        # concurrently so the database can group their fsyncs — a shared
+        # serialized client was measured collapsing 24-thread throughput to
+        # a tenth of the regular path on real-fsync hardware.
         def mysql_fast_enqueue(attributes, now_string)
           return nil if connection.transaction_open?
 
-          fast_enqueue_mysql_mutex.synchronize do
+          begin
             client = fast_enqueue_mysql_client
             begin
               now = "'#{now_string}'"
@@ -232,18 +236,14 @@ module SolidQueue
               end
               result&.first&.values&.first
             rescue Mysql2::Error => e
-              begin client.query("ROLLBACK"); rescue Mysql2::Error; @fast_enqueue_mysql_client = nil; end
+              begin client.query("ROLLBACK"); rescue Mysql2::Error; Thread.current[:sq_enqueue_mysql_client] = nil; end
               raise EnqueueError.new("#{e.class.name}: #{e.message}").tap { |err| err.set_backtrace(e.backtrace) }
             end
           end
         end
 
-        def fast_enqueue_mysql_mutex
-          @fast_enqueue_mysql_mutex ||= Mutex.new
-        end
-
         def fast_enqueue_mysql_client
-          @fast_enqueue_mysql_client ||= begin
+          Thread.current[:sq_enqueue_mysql_client] ||= begin
             config = connection_pool.db_config.configuration_hash
             Mysql2::Client.new(config.merge(flags: Mysql2::Client::MULTI_STATEMENTS))
           end
