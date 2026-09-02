@@ -12,7 +12,7 @@ module SolidQueue
   class EnqueueCoordinator
     include Singleton
 
-    Entry = Struct.new(:attributes, :scheduled, :waiter)
+    Entry = Data.define(:attributes, :scheduled, :waiter)
 
     class << self
       def enqueue(attributes, scheduled) = instance.enqueue(attributes, scheduled)
@@ -28,12 +28,15 @@ module SolidQueue
     end
 
     def enqueue(attributes, scheduled)
-      entry = Entry.new(attributes, scheduled, nil)
+      # Per execution context, fiber-safe, and reused across enqueues; only
+      # followers wait on it, but every entry carries one so entries stay
+      # immutable data
+      waiter = (ActiveSupport::IsolatedExecutionState[:solid_queue_enqueue_waiter] ||= Thread::Queue.new)
+      entry = Entry.new(attributes:, scheduled:, waiter:)
       lead = false
 
       @mutex.synchronize do
         if @leading
-          entry.waiter = (Thread.current[:sq_enqueue_waiter] ||= Thread::Queue.new)
           (@pending ||= []) << entry
         else
           @leading = true
@@ -69,14 +72,14 @@ module SolidQueue
 
         window = pace / 2
         window = 0.01 if window > 0.01
-        deadline = ::Process.clock_gettime(::Process::CLOCK_MONOTONIC) + window
+        deadline = Concurrent.monotonic_time + window
         last_size = -1
         loop do
           sleep(0.001)
           size = @pending&.size || 0
           break if size == last_size
           last_size = size
-          break if ::Process.clock_gettime(::Process::CLOCK_MONOTONIC) >= deadline
+          break if Concurrent.monotonic_time >= deadline
         end
       end
 
@@ -85,7 +88,7 @@ module SolidQueue
       # entries singly so failures attribute to their own callers. Returns
       # the leader's own id (its entry is always first).
       def lead_entries(entries)
-        started = ::Process.clock_gettime(::Process::CLOCK_MONOTONIC)
+        started = Concurrent.monotonic_time
         ids = nil
         error = nil
         begin
@@ -93,7 +96,7 @@ module SolidQueue
         rescue Exception => e
           error = e
         end
-        duration = ::Process.clock_gettime(::Process::CLOCK_MONOTONIC) - started
+        duration = Concurrent.monotonic_time - started
         previous = @pace.get
         @pace.set(previous.zero? ? duration : previous * 0.8 + duration * 0.2)
 

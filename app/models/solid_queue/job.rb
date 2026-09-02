@@ -73,7 +73,7 @@ module SolidQueue
         # the regular path, including callers inside transactions, whose
         # writes must ride their own connection.
         def single_statement_enqueue(active_job)
-          now = Time.now
+          now = Time.current
           scheduled_at = active_job.scheduled_at
           return nil if scheduled_at && scheduled_at > now
           return nil if active_job.respond_to?(:concurrency_key) && active_job.concurrency_key

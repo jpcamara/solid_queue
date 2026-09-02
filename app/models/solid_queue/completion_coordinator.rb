@@ -13,7 +13,10 @@ module SolidQueue
   class CompletionCoordinator
     include Singleton
 
-    Batch = Struct.new(:job_ids, :waiters)
+    # Jobs whose completions are waiting to share a flush, and the queues
+    # their threads are parked on. (Not SolidQueue::Batch, the job-batching
+    # feature — these are flush groups.)
+    PendingFlush = Data.define(:job_ids, :waiters)
 
     class << self
       def finish(execution) = instance.finish(execution)
@@ -43,17 +46,19 @@ module SolidQueue
       waiter = nil
       @mutex.synchronize do
         if @flushing >= max_inflight_flushes
-          # A reused thread-local queue outperforms a promise per completion
-          # at queue throughput rates — measured, not assumed: promise-based
-          # dispatch was removed from this hot path for exactly that reason
-          waiter = (Thread.current[:sq_completion_waiter] ||= Thread::Queue.new)
-          my_batch = (@pending ||= Batch.new([], []))
+          # A reused per-execution-context queue outperforms a promise per
+          # completion at queue throughput rates — measured, not assumed:
+          # promise-based dispatch was removed from this hot path for exactly
+          # that reason. IsolatedExecutionState keeps it correct under fiber
+          # isolation, where contexts sharing a thread must not share queues.
+          waiter = (ActiveSupport::IsolatedExecutionState[:solid_queue_completion_waiter] ||= Thread::Queue.new)
+          my_batch = (@pending ||= PendingFlush.new(job_ids: [], waiters: []))
           my_batch.job_ids << execution.job_id
           my_batch.waiters << waiter
         else
           @flushing += 1
           lead = true
-          my_batch = Batch.new([ execution.job_id ], [])
+          my_batch = PendingFlush.new(job_ids: [ execution.job_id ], waiters: [])
           pending = @pending
           @pending = nil
           if pending
@@ -69,7 +74,7 @@ module SolidQueue
         raise error if error
       else
         message = waiter.pop
-        if message.is_a?(Batch)
+        if message.is_a?(PendingFlush)
           # Promoted: the previous leader handed us the batch our job is in
           error = lead_flush(message)
           raise error if error
@@ -127,14 +132,14 @@ module SolidQueue
           # When flushes are expensive the whole in-flight burst should share
           # one commit: keep collecting in 1ms slices while completions are
           # still arriving, up to half the flush duration
-          deadline = ::Process.clock_gettime(::Process::CLOCK_MONOTONIC) + collect_window_for(pace)
+          deadline = Concurrent.monotonic_time + collect_window_for(pace)
           last_size = -1
           loop do
             sleep(0.001)
             size = @pending&.job_ids&.size || 0
             break if size == last_size
             last_size = size
-            break if ::Process.clock_gettime(::Process::CLOCK_MONOTONIC) >= deadline
+            break if Concurrent.monotonic_time >= deadline
           end
         end
 
@@ -158,7 +163,7 @@ module SolidQueue
       # the flushing, draining whatever has accumulated into each batch
       def threaded_finish(execution)
         ensure_flusher
-        waiter = (Thread.current[:sq_completion_waiter] ||= Thread::Queue.new)
+        waiter = (ActiveSupport::IsolatedExecutionState[:solid_queue_completion_waiter] ||= Thread::Queue.new)
         @work.push([ execution.job_id, waiter ])
         error = waiter.pop
         raise error if error
@@ -193,13 +198,13 @@ module SolidQueue
       # and no dedicated thread sits idle between them
       def lead_flush(batch)
         error = nil
-        started = ::Process.clock_gettime(::Process::CLOCK_MONOTONIC)
+        started = Concurrent.monotonic_time
         begin
           flush(batch.job_ids)
         rescue => e
           error = e
         end
-        record_flush_pace(started, ::Process.clock_gettime(::Process::CLOCK_MONOTONIC))
+        record_flush_pace(started, Concurrent.monotonic_time)
 
         next_batch = nil
         @mutex.synchronize do
