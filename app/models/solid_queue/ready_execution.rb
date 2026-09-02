@@ -8,25 +8,23 @@ module SolidQueue
 
     class << self
       def claim(queue_list, limit, process_id)
+        adapter = DatabaseAdapter.resolve
+
         QueueSelector.new(queue_list, self).scoped_relations.flat_map do |queue_relation|
-          if single_statement_claim_supported?
-            single_statement_claim(queue_relation, process_id, limit).tap do |locked|
-              limit -= locked.size
+          claimed =
+            if adapter.fast_paths?
+              adapter.claim(queue_relation, process_id, limit).tap do |executions|
+                job_ids = executions.map(&:job_id)
+                SolidQueue.instrument(:claim, process_id: process_id, job_ids: job_ids,
+                  claimed_job_ids: job_ids, size: executions.size)
+              end
+            else
+              select_and_lock(queue_relation, process_id, limit).tap do |locked|
+                preload_jobs(locked)
+              end
             end
-          elsif sqlite_claim_supported?
-            sqlite_claim(queue_relation, process_id, limit).tap do |locked|
-              limit -= locked.size
-            end
-          elsif mysql_claim_supported?
-            mysql_claim(queue_relation, process_id, limit).tap do |locked|
-              limit -= locked.size
-            end
-          else
-            select_and_lock(queue_relation, process_id, limit).tap do |locked|
-              limit -= locked.size
-              preload_jobs(locked)
-            end
-          end
+          limit -= claimed.size
+          claimed
         end
       end
 
@@ -37,10 +35,6 @@ module SolidQueue
         claimed.each { |execution| execution.association(:job).target = jobs_by_id[execution.job_id] }
       end
 
-      def single_statement_claim_supported?
-        connection.adapter_name == "PostgreSQL"
-      end
-
       # Only the columns the execution path reads: converting and instantiating
       # unused columns is measurable client CPU at high claim rates
       def hydration_columns
@@ -48,149 +42,8 @@ module SolidQueue
           SolidQueue::Job.column_names).map { |c| "jobs.#{c}" }.join(", ")
       end
 
-      def sqlite_claim_supported?
-        connection.adapter_name == "SQLite"
-      end
-
-      def mysql_claim_supported?
-        connection.adapter_name.match?(/mysql/i)
-      end
-
-      # Same rows and locks as select_and_lock + claiming: candidates locked
-      # with SKIP LOCKED (only the ready rows, via FOR UPDATE OF), jobs read
-      # in the same query, then moved ready -> claimed with bulk writes in
-      # the same transaction. READ COMMITTED skips the gap locks REPEATABLE
-      # READ adds to the ordered range scan, which serialize concurrent
-      # claimers against enqueuers on the index head.
-      def mysql_claim(queue_relation, process_id, limit)
-        return [] if limit <= 0
-
-        conditions = queue_relation.where_clause.any? ? "WHERE #{queue_relation.where_clause.ast.to_sql}" : ""
-        select_sql = <<~SQL
-          SELECT re.id AS ready_id, #{hydration_columns}
-          FROM solid_queue_ready_executions re
-          INNER JOIN solid_queue_jobs jobs ON jobs.id = re.job_id
-          #{conditions.gsub("solid_queue_ready_executions", "re")}
-          ORDER BY re.priority ASC, re.job_id ASC
-          LIMIT #{limit.to_i}
-          FOR UPDATE OF re SKIP LOCKED
-        SQL
-
-        claimed = transaction(isolation: :read_committed) do
-          result = connection.select_all(select_sql)
-          next [] if result.rows.empty?
-
-          rows = result.rows.map do |row|
-            attrs = result.columns.zip(row).to_h
-            ready_id = attrs.delete("ready_id")
-            job = SolidQueue::Job.instantiate(attrs)
-            execution = SolidQueue::ClaimedExecution.instantiate_claimed(job_id: job.id, process_id: process_id)
-            execution.association(:job).target = job
-            [ ready_id, execution ]
-          end
-
-          now = Time.current
-          SolidQueue::ClaimedExecution.insert_all!(rows.map { |_, e| { job_id: e.job_id, process_id: process_id, created_at: now } })
-          where(id: rows.map(&:first)).delete_all
-
-          rows.map(&:last)
-        end
-
-        claimed.tap do |executions|
-          job_ids = executions.map(&:job_id)
-          SolidQueue.instrument(:claim, process_id: process_id, job_ids: job_ids,
-            claimed_job_ids: job_ids, size: executions.size)
-        end
-      end
-
-      # SQLite is single-writer, so candidates need no row locks: read them
-      # joined with their jobs in one query, then move them ready -> claimed
-      # with two plain statements in one transaction. Same rows, same
-      # atomicity, ordinary SQL throughout.
-      def sqlite_claim(queue_relation, process_id, limit)
-        return [] if limit <= 0
-
-        candidates_sql = queue_relation.ordered.limit(limit).select(:id, :job_id).to_sql
-        result = connection.select_all(<<~SQL)
-          SELECT c.id AS ready_id, #{hydration_columns}
-          FROM (#{candidates_sql}) c INNER JOIN solid_queue_jobs jobs ON jobs.id = c.job_id
-        SQL
-        return [] if result.rows.empty?
-
-        claimed = result.rows.map do |row|
-          attrs = result.columns.zip(row).to_h
-          ready_id = attrs.delete("ready_id")
-          job = SolidQueue::Job.instantiate(attrs)
-          execution = SolidQueue::ClaimedExecution.instantiate_claimed(job_id: job.id, process_id: process_id)
-          execution.association(:job).target = job
-          [ ready_id, execution ]
-        end
-
-        now = connection.quote(Time.current)
-        SolidQueue::SqliteWriterFunnel.acquire(connection_pool) do
-          transaction do
-            values = claimed.map { |_, e| "(#{e.job_id}, #{process_id ? connection.quote(process_id) : "NULL"}, #{now})" }.join(",")
-            connection.execute("INSERT INTO solid_queue_claimed_executions (job_id, process_id, created_at) VALUES #{values}")
-            connection.execute("DELETE FROM solid_queue_ready_executions WHERE id IN (#{claimed.map(&:first).join(",")})")
-          end
-        end
-
-        claimed.map(&:last).tap do |executions|
-          job_ids = executions.map(&:job_id)
-          SolidQueue.instrument(:claim, process_id: process_id, job_ids: job_ids,
-            claimed_job_ids: job_ids, size: executions.size)
-        end
-      end
 
 
-
-
-      # The same rows, locks and atomicity as select_and_lock + claiming, in
-      # one statement: candidates are locked with SKIP LOCKED, moved into
-      # claimed executions and deleted from ready, with the job row hydrated
-      # alongside so execution doesn't need to load it
-      def single_statement_claim(queue_relation, process_id, limit)
-        return [] if limit <= 0
-
-        candidates_sql = queue_relation.ordered.limit(limit).non_blocking_lock.select(:id, :job_id).to_sql
-
-        @claim_sql_cache ||= {}
-        sql = <<~SQL
-          WITH candidates AS (#{candidates_sql}),
-          deleted AS (
-            DELETE FROM solid_queue_ready_executions WHERE id IN (SELECT id FROM candidates)
-          ),
-          claimed AS (
-            INSERT INTO solid_queue_claimed_executions (job_id, process_id, created_at)
-            SELECT job_id, #{process_id ? connection.quote(process_id) : "NULL"}, now() FROM candidates
-            RETURNING id, job_id, process_id, created_at
-          )
-          SELECT claimed.id AS claimed_id, claimed.job_id AS claimed_job_id,
-                 claimed.process_id AS claimed_process_id, claimed.created_at AS claimed_created_at,
-                 #{hydration_columns}
-          FROM claimed INNER JOIN solid_queue_jobs jobs ON jobs.id = claimed.job_id
-        SQL
-
-        # A plain statement every poll: session-level PREPARE breaks through
-        # transaction-pooling proxies, and re-parsing the CTE costs a few
-        # percent that portability is worth
-        result = connection.select_all(sql)
-        job_columns = SolidQueue::Job.column_names
-        result.rows.map do |row|
-          attrs = result.columns.zip(row).to_h
-          execution = SolidQueue::ClaimedExecution.instantiate(
-            "id" => attrs["claimed_id"], "job_id" => attrs["claimed_job_id"],
-            "process_id" => attrs["claimed_process_id"], "created_at" => attrs["claimed_created_at"]
-          )
-          job = SolidQueue::Job.instantiate(attrs.slice(*job_columns))
-          execution.association(:job).target = job
-          execution
-        end.tap do |claimed|
-          job_ids = claimed.map(&:job_id)
-          SolidQueue.instrument(:claim, process_id: process_id, job_ids: job_ids,
-            claimed_job_ids: job_ids, size: claimed.size)
-        end
-      end
 
       def aggregated_count_across(queue_list)
         QueueSelector.new(queue_list, self).scoped_relations.map(&:count).sum
