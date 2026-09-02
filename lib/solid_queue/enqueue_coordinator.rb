@@ -154,10 +154,12 @@ module SolidQueue
         now = Time.current
         job_rows = entries.map do |entry|
           attributes = entry.attributes
-          { queue_name: attributes["queue_name"], class_name: attributes["class_name"],
-            arguments: attributes["arguments"], priority: attributes["priority"],
-            active_job_id: attributes["active_job_id"], scheduled_at: entry.scheduled,
-            created_at: now, updated_at: now }
+          row = { queue_name: attributes["queue_name"], class_name: attributes["class_name"],
+                  arguments: attributes["arguments"], priority: attributes["priority"],
+                  active_job_id: attributes["active_job_id"], scheduled_at: entry.scheduled,
+                  created_at: now, updated_at: now }
+          row[:batch_id] = attributes["batch_id"] if attributes.key?("batch_id")
+          row
         end
 
         Job.connection_pool.with_connection do

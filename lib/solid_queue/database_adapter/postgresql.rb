@@ -40,15 +40,26 @@ module SolidQueue
       end
 
       # One atomic statement: the delete and the finish share a snapshot and
-      # a commit without transaction round trips
-      def flush_completions(job_ids)
-        Job.connection.exec_update(<<~SQL)
-          WITH deleted AS (
-            DELETE FROM solid_queue_claimed_executions WHERE job_id IN (#{job_ids.join(",")}) RETURNING job_id
-          )
-          UPDATE solid_queue_jobs SET finished_at = now()
-          WHERE id IN (SELECT job_id FROM deleted)
-        SQL
+      # a commit without transaction round trips; batched jobs' tracking
+      # rows go in the same statement, guarded by the same ownership check
+      FLUSH_SQL = <<~SQL.squish
+        WITH deleted AS (
+          DELETE FROM solid_queue_claimed_executions WHERE job_id = ANY($1::bigint[]) RETURNING job_id
+        )
+        UPDATE solid_queue_jobs SET finished_at = now() WHERE id IN (SELECT job_id FROM deleted)
+      SQL
+      FLUSH_TRACKED_SQL = <<~SQL.squish
+        WITH deleted AS (
+          DELETE FROM solid_queue_claimed_executions WHERE job_id = ANY($1::bigint[]) RETURNING job_id
+        ), untracked AS (
+          DELETE FROM solid_queue_batch_executions WHERE job_id IN (SELECT job_id FROM deleted)
+        )
+        UPDATE solid_queue_jobs SET finished_at = now() WHERE id IN (SELECT job_id FROM deleted)
+      SQL
+
+      def flush_completions(job_ids, tracked: false)
+        Job.connection.exec_update(tracked ? FLUSH_TRACKED_SQL : FLUSH_SQL, "SolidQueue::Job Finish",
+          [ array_bind(:job_ids, job_ids, integer_array) ])
       end
 
       # One atomic statement, one round trip, one implicit commit: the job
@@ -82,6 +93,10 @@ module SolidQueue
       SQL
 
       def write_enqueue_batch(job_rows, now)
+        # Rows joining a job batch need the batch's counter raised and their
+        # tracking rows written alongside: the transactional path
+        return super if job_rows.any? { |row| row[:batch_id] }
+
         if job_rows.one?
           row = job_rows.first
           binds = [

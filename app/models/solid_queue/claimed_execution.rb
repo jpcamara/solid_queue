@@ -111,13 +111,12 @@ class SolidQueue::ClaimedExecution < SolidQueue::Execution
       end
     end
 
-    # Plain jobs on PostgreSQL: no concurrency semaphore to release, no batch
-    # tracking, no preserve=false destroy — the finish collapses to one atomic
-    # statement with the claimed row's deletion as the ownership guard
+    # Jobs with no concurrency semaphore to release and no preserve=false
+    # destroy finish through the group-commit coordinator, which drops batch
+    # tracking rows in the same commit and checks batch completion once per
+    # batch afterwards
     def single_statement_finish?
-      SolidQueue.preserve_finished_jobs? &&
-        job.concurrency_key.nil? &&
-        !(job.respond_to?(:batched?) && job.batched?)
+      SolidQueue.preserve_finished_jobs? && job.concurrency_key.nil?
     end
 
     def single_statement_finish

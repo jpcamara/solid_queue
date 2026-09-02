@@ -13,10 +13,11 @@ module SolidQueue
   class CompletionCoordinator
     include Singleton
 
-    # Jobs whose completions are waiting to share a flush, and the queues
-    # their threads are parked on. (Not SolidQueue::Batch, the job-batching
-    # feature — these are flush groups.)
-    PendingFlush = Data.define(:job_ids, :waiters)
+    # Jobs whose completions are waiting to share a flush, the ids of the
+    # job batches those jobs belong to, and the queues their threads are
+    # parked on. (A flush group is not a SolidQueue::Batch; batch_ids are
+    # the ids of those.)
+    PendingFlush = Data.define(:job_ids, :batch_ids, :waiters)
 
     class << self
       def finish(execution) = instance.finish(execution)
@@ -38,7 +39,9 @@ module SolidQueue
     # up and are flushed by the next arrival (or themselves), so batches size
     # to flush latency with zero idle gaps.
     def finish(execution)
-      return threaded_finish(execution) if adapter.dedicated_flusher?
+      job_id = execution.job_id
+      batch_id = execution.job.batch_id if execution.job.respond_to?(:batched?) && execution.job.batched?
+      return threaded_finish(job_id, batch_id) if adapter.dedicated_flusher?
 
       my_batch = nil
       lead = false
@@ -52,17 +55,19 @@ module SolidQueue
           # that reason. IsolatedExecutionState keeps it correct under fiber
           # isolation, where contexts sharing a thread must not share queues.
           waiter = (ActiveSupport::IsolatedExecutionState[:solid_queue_completion_waiter] ||= Thread::Queue.new)
-          my_batch = (@pending ||= PendingFlush.new(job_ids: [], waiters: []))
-          my_batch.job_ids << execution.job_id
+          my_batch = (@pending ||= PendingFlush.new(job_ids: [], batch_ids: [], waiters: []))
+          my_batch.job_ids << job_id
+          my_batch.batch_ids << batch_id if batch_id
           my_batch.waiters << waiter
         else
           @flushing += 1
           lead = true
-          my_batch = PendingFlush.new(job_ids: [ execution.job_id ], waiters: [])
+          my_batch = PendingFlush.new(job_ids: [ job_id ], batch_ids: batch_id ? [ batch_id ] : [], waiters: [])
           pending = @pending
           @pending = nil
           if pending
             my_batch.job_ids.concat(pending.job_ids)
+            my_batch.batch_ids.concat(pending.batch_ids)
             my_batch.waiters.concat(pending.waiters)
           end
         end
@@ -147,6 +152,7 @@ module SolidQueue
           if (joined = @pending)
             @pending = nil
             my_batch.job_ids.concat(joined.job_ids)
+            my_batch.batch_ids.concat(joined.batch_ids)
             my_batch.waiters.concat(joined.waiters)
           end
         end
@@ -161,10 +167,10 @@ module SolidQueue
       # Single-writer databases do best with a single writer thread: pool
       # threads push their completions onto a queue and one flusher owns all
       # the flushing, draining whatever has accumulated into each batch
-      def threaded_finish(execution)
+      def threaded_finish(job_id, batch_id)
         ensure_flusher
         waiter = (ActiveSupport::IsolatedExecutionState[:solid_queue_completion_waiter] ||= Thread::Queue.new)
-        @work.push([ execution.job_id, waiter ])
+        @work.push([ job_id, batch_id, waiter ])
         error = waiter.pop
         raise error if error
       end
@@ -180,13 +186,16 @@ module SolidQueue
               entries = [ @work.pop ]
               entries << @work.pop until @work.empty?
 
+              job_ids = entries.map(&:first)
+              batch_ids = entries.filter_map { |entry| entry[1] }
               error = nil
               begin
-                flush(entries.map(&:first))
+                flush(job_ids, batch_ids)
+                finish_batches(batch_ids)
               rescue => e
                 error = e
               end
-              entries.each { |_, waiter| waiter.push(error) }
+              entries.each { |entry| entry.last.push(error) }
             end
           end
           @flusher.name = "solid_queue_completion_flusher"
@@ -200,7 +209,7 @@ module SolidQueue
         error = nil
         started = Concurrent.monotonic_time
         begin
-          flush(batch.job_ids)
+          flush(batch.job_ids, batch.batch_ids)
         rescue => e
           error = e
         end
@@ -214,14 +223,35 @@ module SolidQueue
         end
         next_batch.waiters.shift.push(next_batch) if next_batch
 
+        finish_batches(batch.batch_ids) unless error
         batch.waiters.each { |follower| follower.push(error) }
         error
       end
 
-      # Each batch flushes atomically through the database adapter: either
-      # the whole batch is durable and finished, or none of it is
-      def flush(job_ids)
-        adapter.flush_completions(job_ids)
+      # Each flush group commits atomically through the database adapter:
+      # either the whole group is durable and finished, or none of it is.
+      # Batched jobs drop their tracking rows in that same commit.
+      def flush(job_ids, batch_ids)
+        adapter.flush_completions(job_ids, tracked: batch_ids.any?)
+      end
+
+      # The completion check each batched job's finish would have run after
+      # its own commit runs after the group's commit instead. One query
+      # finds which of the group's batches have no outstanding work left;
+      # only those run Batch#finish — the same compare-and-set and finalize,
+      # so callbacks still fire exactly once. A check that fails is
+      # instrumented and left to the batch sweeper, which exists for
+      # exactly that.
+      def finish_batches(batch_ids)
+        return if batch_ids.empty?
+
+        ids = batch_ids.uniq
+        Batch.select(:id, :finished_at, :enqueued_at).where(id: ids).unfinished.enqueued
+          .where.not(id: BatchExecution.where(batch_id: ids).select(:batch_id)).each do |batch|
+          batch.finish
+        rescue => e
+          SolidQueue.instrument(:batch_progress_error, batch_id: batch.id, job_id: nil, error: e)
+        end
       end
 
       def adapter

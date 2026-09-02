@@ -18,6 +18,13 @@ module SolidQueue
         INSERT INTO solid_queue_jobs (queue_name, class_name, arguments, priority, active_job_id, scheduled_at, created_at, updated_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING id
       SQL
+      INSERT_BATCHED_JOB = <<~SQL.squish
+        INSERT INTO solid_queue_jobs (queue_name, class_name, arguments, priority, active_job_id, scheduled_at, created_at, updated_at, batch_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id
+      SQL
+      INSERT_TRACKING = <<~SQL.squish
+        INSERT INTO solid_queue_batch_executions (job_id, batch_id, created_at) VALUES (?, ?, ?)
+      SQL
       INSERT_READY = <<~SQL.squish
         INSERT INTO solid_queue_ready_executions (job_id, queue_name, priority, created_at) VALUES (?, ?, ?, ?)
       SQL
@@ -27,6 +34,7 @@ module SolidQueue
       SQL
       DELETE_READY = "DELETE FROM solid_queue_ready_executions WHERE id IN (SELECT value FROM json_each(?))"
       DELETE_CLAIMED = "DELETE FROM solid_queue_claimed_executions WHERE job_id IN (SELECT value FROM json_each(?))"
+      DELETE_TRACKED = "DELETE FROM solid_queue_batch_executions WHERE job_id IN (SELECT value FROM json_each(?))"
       FINISH_JOBS = "UPDATE solid_queue_jobs SET finished_at = ? WHERE id IN (SELECT value FROM json_each(?))"
 
       # Completions flush from a dedicated thread on single-writer databases
@@ -60,11 +68,12 @@ module SolidQueue
         rows.map(&:last)
       end
 
-      def flush_completions(job_ids)
+      def flush_completions(job_ids, tracked: false)
         serialize_writes do
           Job.transaction do
             ids = json_bind(job_ids)
             execute(DELETE_CLAIMED, "SolidQueue::ClaimedExecution Destroy", [ ids ])
+            execute(DELETE_TRACKED, "SolidQueue::BatchExecution Destroy", [ ids ]) if tracked
             execute(FINISH_JOBS, "SolidQueue::Job Update", [ bind(Job, :finished_at, Time.current), ids ])
           end
         end
@@ -75,12 +84,22 @@ module SolidQueue
       # SQL would have to be built and compiled per batch
       def write_enqueue_batch(job_rows, now)
         Job.transaction do
+          count_batched(job_rows)
           job_rows.map do |row|
-            id = execute(INSERT_JOB, "SolidQueue::Job Create", job_binds(row, now)).rows.first.first
+            id = if row[:batch_id]
+              execute(INSERT_BATCHED_JOB, "SolidQueue::Job Create", job_binds(row, now) << bind(Job, :batch_id, row[:batch_id])).rows.first.first
+            else
+              execute(INSERT_JOB, "SolidQueue::Job Create", job_binds(row, now)).rows.first.first
+            end
             execute(INSERT_READY, "SolidQueue::ReadyExecution Create", [
               bind(ReadyExecution, :job_id, id), bind(ReadyExecution, :queue_name, row[:queue_name]),
               bind(ReadyExecution, :priority, row[:priority]), bind(ReadyExecution, :created_at, now)
             ])
+            if row[:batch_id]
+              execute(INSERT_TRACKING, "SolidQueue::BatchExecution Create", [
+                bind(BatchExecution, :job_id, id), bind(BatchExecution, :batch_id, row[:batch_id]), bind(BatchExecution, :created_at, now)
+              ])
+            end
             id
           end
         end

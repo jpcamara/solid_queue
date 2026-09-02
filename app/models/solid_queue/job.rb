@@ -77,7 +77,6 @@ module SolidQueue
           scheduled_at = active_job.scheduled_at
           return nil if scheduled_at && scheduled_at > now
           return nil if active_job.respond_to?(:concurrency_key) && active_job.concurrency_key
-          return nil if active_job.respond_to?(:batch_id) && active_job.batch_id
           return nil unless DatabaseAdapter.resolve.fast_paths?
           return nil if connection_pool.active_connection&.transaction_open?
 
@@ -89,6 +88,7 @@ module SolidQueue
             "active_job_id" => active_job.job_id,
             "scheduled_at" => scheduled_at
           }
+          attributes["batch_id"] = active_job.batch_id if Batch.migrated? && active_job.respond_to?(:batch_id)
 
           id = wrap_enqueue_errors do
             EnqueueCoordinator.enqueue(attributes, scheduled_at)
