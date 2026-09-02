@@ -221,9 +221,21 @@ module SolidQueue
       end
 
       def flush_batch(job_ids)
-        ClaimedExecution.transaction do
-          ClaimedExecution.where(job_id: job_ids).delete_all
-          Job.where(id: job_ids).update_all(finished_at: Time.current)
+        if adapter == :postgresql
+          # One atomic statement: the delete and the finish share a snapshot
+          # and a commit without transaction round trips
+          Job.connection.exec_update(<<~SQL)
+            WITH deleted AS (
+              DELETE FROM solid_queue_claimed_executions WHERE job_id IN (#{job_ids.join(",")}) RETURNING job_id
+            )
+            UPDATE solid_queue_jobs SET finished_at = now()
+            WHERE id IN (SELECT job_id FROM deleted)
+          SQL
+        else
+          ClaimedExecution.transaction do
+            ClaimedExecution.where(job_id: job_ids).delete_all
+            Job.where(id: job_ids).update_all(finished_at: Time.current)
+          end
         end
       end
 
