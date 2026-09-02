@@ -109,10 +109,6 @@ module SolidQueue
           ]
         end
 
-        def bind(model, name, value)
-          ActiveRecord::Relation::QueryAttribute.new(name.to_s, value, model.type_for_attribute(name.to_s))
-        end
-
         def json_bind(ids)
           ActiveRecord::Relation::QueryAttribute.new("ids", JSON.dump(ids), ActiveModel::Type::String.new)
         end

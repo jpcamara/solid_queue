@@ -72,6 +72,12 @@ module SolidQueue
     end
 
     private
+      # A typed bind parameter for a model column: the attribute type
+      # serializes the value exactly as the model would
+      def bind(model, column, value)
+        ActiveRecord::Relation::QueryAttribute.new(column.to_s, value, model.type_for_attribute(column.to_s))
+      end
+
       # Shared two-phase claim: a hydrating read of the candidates, then the
       # ready -> claimed move by id inside the caller-supplied transaction
       # discipline. Subclasses provide the locked (or lock-free) read.
