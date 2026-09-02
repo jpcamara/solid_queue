@@ -12,7 +12,7 @@ module SolidQueue
       def resolve
         @resolve ||= case Record.connection_pool.db_config.adapter
         when "postgresql" then Postgresql.new
-        when /mysql/ then Mysql.new
+        when /mysql|trilogy/ then Mysql.new
         when /sqlite/ then Sqlite.new
         else Generic.new
         end

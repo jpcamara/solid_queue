@@ -8,6 +8,27 @@ module SolidQueue
       # and fairer than colliding with the database's busy handler
       WRITE_MUTEX = Mutex.new
 
+      # Parameterized statements through Active Record's per-connection
+      # statement cache. SQLite runs in-process, so there is no server
+      # session for a pooler to swap out from under a prepared statement,
+      # and compiling the same statement on every call was the largest cost
+      # left in these paths. Id lists travel as one JSON bind through
+      # json_each so a statement's shape never varies with batch size.
+      INSERT_JOB = <<~SQL.squish
+        INSERT INTO solid_queue_jobs (queue_name, class_name, arguments, priority, active_job_id, scheduled_at, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING id
+      SQL
+      INSERT_READY = <<~SQL.squish
+        INSERT INTO solid_queue_ready_executions (job_id, queue_name, priority, created_at) VALUES (?, ?, ?, ?)
+      SQL
+      INSERT_CLAIMED = <<~SQL.squish
+        INSERT INTO solid_queue_claimed_executions (job_id, process_id, created_at)
+        SELECT value, ?, ? FROM json_each(?)
+      SQL
+      DELETE_READY = "DELETE FROM solid_queue_ready_executions WHERE id IN (SELECT value FROM json_each(?))"
+      DELETE_CLAIMED = "DELETE FROM solid_queue_claimed_executions WHERE job_id IN (SELECT value FROM json_each(?))"
+      FINISH_JOBS = "UPDATE solid_queue_jobs SET finished_at = ? WHERE id IN (SELECT value FROM json_each(?))"
+
       # Completions flush from a dedicated thread on single-writer databases
       def dedicated_flusher?
         true
@@ -19,7 +40,7 @@ module SolidQueue
 
       # Single-writer, so candidates need no row locks: read them joined
       # with their jobs in one query, then move them ready -> claimed with
-      # two plain statements in one serialized transaction
+      # two cached statements in one serialized transaction
       def claim(queue_relation, process_id, limit)
         return [] if limit <= 0
 
@@ -40,8 +61,61 @@ module SolidQueue
       end
 
       def flush_completions(job_ids)
-        serialize_writes { super }
+        serialize_writes do
+          Job.transaction do
+            ids = json_bind(job_ids)
+            execute(DELETE_CLAIMED, "SolidQueue::ClaimedExecution Destroy", [ ids ])
+            execute(FINISH_JOBS, "SolidQueue::Job Update", [ bind(Job, :finished_at, Time.current), ids ])
+          end
+        end
       end
+
+      # Round trips are function calls here, so each row goes through the
+      # cached single-row statements rather than a multi-row insert whose
+      # SQL would have to be built and compiled per batch
+      def write_enqueue_batch(job_rows, now)
+        Job.transaction do
+          job_rows.map do |row|
+            id = execute(INSERT_JOB, "SolidQueue::Job Create", job_binds(row, now)).rows.first.first
+            execute(INSERT_READY, "SolidQueue::ReadyExecution Create", [
+              bind(ReadyExecution, :job_id, id), bind(ReadyExecution, :queue_name, row[:queue_name]),
+              bind(ReadyExecution, :priority, row[:priority]), bind(ReadyExecution, :created_at, now)
+            ])
+            id
+          end
+        end
+      end
+
+      private
+        def move_to_claimed(rows, process_id)
+          execute(INSERT_CLAIMED, "SolidQueue::ClaimedExecution Create", [
+            bind(ClaimedExecution, :process_id, process_id), bind(ClaimedExecution, :created_at, Time.current),
+            json_bind(rows.map { |_, execution| execution.job_id })
+          ])
+          execute(DELETE_READY, "SolidQueue::ReadyExecution Destroy", [ json_bind(rows.map(&:first)) ])
+        end
+
+        def execute(sql, name, binds)
+          connection = Job.connection
+          connection.exec_query(sql, name, binds, prepare: connection.prepared_statements?)
+        end
+
+        def job_binds(row, now)
+          [
+            bind(Job, :queue_name, row[:queue_name]), bind(Job, :class_name, row[:class_name]),
+            bind(Job, :arguments, row[:arguments]), bind(Job, :priority, row[:priority]),
+            bind(Job, :active_job_id, row[:active_job_id]), bind(Job, :scheduled_at, row[:scheduled_at]),
+            bind(Job, :created_at, now), bind(Job, :updated_at, now)
+          ]
+        end
+
+        def bind(model, name, value)
+          ActiveRecord::Relation::QueryAttribute.new(name.to_s, value, model.type_for_attribute(name.to_s))
+        end
+
+        def json_bind(ids)
+          ActiveRecord::Relation::QueryAttribute.new("ids", JSON.dump(ids), ActiveModel::Type::String.new)
+        end
     end
   end
 end
