@@ -168,34 +168,24 @@ module SolidQueue
 
         def sqlite_fast_enqueue(attributes, now_string)
           conn = connection
-          prepared = conn.instance_variable_get(:@sq_prepared_enqueue) || conn.instance_variable_set(:@sq_prepared_enqueue, {})
-          job_stmt = prepared[:job] ||= conn.raw_connection.prepare(
-            "INSERT INTO solid_queue_jobs (queue_name, class_name, arguments, priority, active_job_id, scheduled_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
-          )
-          ready_stmt = prepared[:ready] ||= conn.raw_connection.prepare(
-            "INSERT INTO solid_queue_ready_executions (job_id, queue_name, priority, created_at) VALUES (?, ?, ?, ?)"
-          )
-          begin_stmt = prepared[:begin] ||= conn.raw_connection.prepare("BEGIN IMMEDIATE")
-          commit_stmt = prepared[:commit] ||= conn.raw_connection.prepare("COMMIT")
+          scheduled = attributes["scheduled_at"] ? conn.quote(attributes["scheduled_at"]) : "NULL"
+          insert_sql = "INSERT INTO solid_queue_jobs (queue_name, class_name, arguments, priority, active_job_id, scheduled_at, created_at, updated_at) " \
+            "VALUES (#{conn.quote(attributes["queue_name"])}, #{conn.quote(attributes["class_name"])}, #{conn.quote(attributes["arguments"])}, " \
+            "#{attributes["priority"].to_i}, #{conn.quote(attributes["active_job_id"])}, #{scheduled}, '#{now_string}', '#{now_string}')"
 
-          now = now_string
-          scheduled = attributes["scheduled_at"] && conn.quoted_date(attributes["scheduled_at"])
           id = nil
           SolidQueue::SqliteWriterFunnel.acquire(connection_pool) do
             if conn.transaction_open?
               transaction do
-                # Raw statements bypass Active Record, which otherwise defers
-                # BEGIN until its own first statement — materialize so these
-                # writes are inside the transaction they appear to be in
                 conn.materialize_transactions
-                id = sqlite_fast_insert(conn, job_stmt, ready_stmt, attributes, scheduled, now)
+                id = sqlite_fast_insert(conn, insert_sql, attributes, now_string)
               end
             else
               raw = conn.raw_connection
               begin
-                begin_stmt.execute
-                id = sqlite_fast_insert(conn, job_stmt, ready_stmt, attributes, scheduled, now)
-                commit_stmt.execute
+                raw.execute("BEGIN IMMEDIATE")
+                id = sqlite_fast_insert(conn, insert_sql, attributes, now_string)
+                raw.execute("COMMIT")
               rescue Exception
                 begin raw.execute("ROLLBACK"); rescue SQLite3::Exception; end
                 raise
@@ -205,13 +195,11 @@ module SolidQueue
           id
         end
 
-        def sqlite_fast_insert(conn, job_stmt, ready_stmt, attributes, scheduled, now)
-          job_stmt.execute(
-            attributes["queue_name"], attributes["class_name"], attributes["arguments"],
-            attributes["priority"], attributes["active_job_id"], scheduled, now, now
-          ).to_a
-          id = conn.raw_connection.last_insert_row_id
-          ready_stmt.execute(id, attributes["queue_name"], attributes["priority"], now).to_a
+        def sqlite_fast_insert(conn, insert_sql, attributes, now_string)
+          conn.execute(insert_sql)
+          id = conn.select_value("SELECT last_insert_rowid()")
+          conn.execute("INSERT INTO solid_queue_ready_executions (job_id, queue_name, priority, created_at) " \
+            "VALUES (#{id}, #{conn.quote(attributes["queue_name"])}, #{attributes["priority"].to_i}, '#{now_string}')")
           id
         end
 

@@ -239,14 +239,11 @@ module SolidQueue
           end
         else
           connection = flusher_ar_connection
-          @sqlite_delete_stmt ||= connection.raw_connection.prepare("DELETE FROM solid_queue_claimed_executions WHERE job_id IN (SELECT value FROM json_each(?))")
-          @sqlite_update_stmt ||= connection.raw_connection.prepare("UPDATE solid_queue_jobs SET finished_at = ? WHERE id IN (SELECT value FROM json_each(?))")
-          ids_json = "[#{ids}]"
-          now = connection.quoted_date(Time.current)
+          now = connection.quote(Time.current)
           SqliteWriterFunnel.acquire(ClaimedExecution.connection_pool) do
             connection.transaction do
-              @sqlite_delete_stmt.execute(ids_json).to_a
-              @sqlite_update_stmt.execute(now, ids_json).to_a
+              connection.execute("DELETE FROM solid_queue_claimed_executions WHERE job_id IN (#{ids})")
+              connection.execute("UPDATE solid_queue_jobs SET finished_at = #{now} WHERE id IN (#{ids})")
             end
           end
         end

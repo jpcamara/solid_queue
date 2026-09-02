@@ -134,25 +134,20 @@ module SolidQueue
 
       # SQLite is single-writer, so candidates need no row locks: read them
       # joined with their jobs in one query, then move them ready -> claimed
-      # with two statements in one transaction. Same rows, same atomicity.
-      # All three statements are prepared once per connection and shape;
-      # id lists bind as JSON arrays so the shapes stay stable.
+      # with two plain statements in one transaction. Same rows, same
+      # atomicity, ordinary SQL throughout.
       def sqlite_claim(queue_relation, process_id, limit)
         return [] if limit <= 0
 
-        candidates_sql = queue_relation.ordered.limit(limit).select(:id, :job_id).to_sql.sub(/LIMIT \d+\z/, "LIMIT ?")
-        select_stmt = sqlite_prepared(candidates_sql) do
-          <<~SQL
-            SELECT c.id AS ready_id, #{hydration_columns}
-            FROM (#{candidates_sql}) c INNER JOIN solid_queue_jobs jobs ON jobs.id = c.job_id
-          SQL
-        end
-        columns = select_stmt.columns
-        rows = select_stmt.execute(limit.to_i).to_a
-        return [] if rows.empty?
+        candidates_sql = queue_relation.ordered.limit(limit).select(:id, :job_id).to_sql
+        result = connection.select_all(<<~SQL)
+          SELECT c.id AS ready_id, #{hydration_columns}
+          FROM (#{candidates_sql}) c INNER JOIN solid_queue_jobs jobs ON jobs.id = c.job_id
+        SQL
+        return [] if result.rows.empty?
 
-        claimed = rows.map do |row|
-          attrs = row.is_a?(Hash) ? row : columns.zip(row).to_h
+        claimed = result.rows.map do |row|
+          attrs = result.columns.zip(row).to_h
           ready_id = attrs.delete("ready_id")
           job = SolidQueue::Job.instantiate(attrs)
           execution = SolidQueue::ClaimedExecution.instantiate_claimed(job_id: job.id, process_id: process_id)
@@ -160,19 +155,12 @@ module SolidQueue
           [ ready_id, execution ]
         end
 
-        insert_stmt = sqlite_prepared("claim_insert") do
-          "INSERT INTO solid_queue_claimed_executions (job_id, process_id, created_at) SELECT value, ?, ? FROM json_each(?)"
-        end
-        delete_stmt = sqlite_prepared("claim_delete") do
-          "DELETE FROM solid_queue_ready_executions WHERE id IN (SELECT value FROM json_each(?))"
-        end
-        job_ids_json = "[#{claimed.map { |_, e| e.job_id }.join(",")}]"
-        now = connection.quoted_date(Time.current)
-
+        now = connection.quote(Time.current)
         SolidQueue::SqliteWriterFunnel.acquire(connection_pool) do
           transaction do
-            insert_stmt.execute(process_id, now, job_ids_json).to_a
-            delete_stmt.execute("[#{claimed.map(&:first).join(",")}]").to_a
+            values = claimed.map { |_, e| "(#{e.job_id}, #{process_id ? connection.quote(process_id) : "NULL"}, #{now})" }.join(",")
+            connection.execute("INSERT INTO solid_queue_claimed_executions (job_id, process_id, created_at) VALUES #{values}")
+            connection.execute("DELETE FROM solid_queue_ready_executions WHERE id IN (#{claimed.map(&:first).join(",")})")
           end
         end
 
@@ -183,21 +171,8 @@ module SolidQueue
         end
       end
 
-      # Statements prepared once per connection and shape, on the same
-      # connection the claim's transaction runs on
-      def sqlite_prepared(key)
-        conn = connection
-        prepared = conn.instance_variable_get(:@sq_prepared_claims) || conn.instance_variable_set(:@sq_prepared_claims, {})
-        prepared[key] ||= conn.raw_connection.prepare(yield)
-      end
 
 
-      # A plain statement every poll: session-level PREPARE breaks through
-      # transaction-pooling proxies, and re-parsing the CTE costs a few
-      # percent that portability is worth
-      def execute_prepared_claim(sql, shape_key)
-        connection.select_all(sql)
-      end
 
       # The same rows, locks and atomicity as select_and_lock + claiming, in
       # one statement: candidates are locked with SKIP LOCKED, moved into
@@ -225,7 +200,10 @@ module SolidQueue
           FROM claimed INNER JOIN solid_queue_jobs jobs ON jobs.id = claimed.job_id
         SQL
 
-        result = execute_prepared_claim(sql, candidates_sql)
+        # A plain statement every poll: session-level PREPARE breaks through
+        # transaction-pooling proxies, and re-parsing the CTE costs a few
+        # percent that portability is worth
+        result = connection.select_all(sql)
         job_columns = SolidQueue::Job.column_names
         result.rows.map do |row|
           attrs = result.columns.zip(row).to_h
