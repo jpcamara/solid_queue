@@ -103,10 +103,12 @@ module SolidQueue
           ))
         end
 
+        public
+
         # The database timestamp format Active Record uses, with the
         # formatted prefix reused within the same second. A concurrently
         # written cache entry is valid for its own second either way.
-        def fast_enqueue_timestamp(now)
+        def fast_enqueue_timestamp(now) # :nodoc:
           utc = now.getutc
           sec = utc.to_i
           cached_sec, prefix = @fast_enqueue_ts_cache
@@ -118,6 +120,8 @@ module SolidQueue
 
           format("%s%06d", prefix, utc.usec)
         end
+
+        private
 
         PG_ENQUEUE_SQL = <<~SQL
           WITH job AS (
@@ -204,50 +208,34 @@ module SolidQueue
           id
         end
 
-        # One multi-statement round trip holding the same transaction; only
-        # used outside caller transactions, which the regular path serves.
+        # Routed through the enqueue coordinator: concurrent enqueuers share
+        # one batched insert transaction (each still returning only after
+        # that durable commit), and a lone enqueuer is simply a batch of one.
+        # Only used outside caller transactions, which the regular path serves.
+        def mysql_fast_enqueue(attributes, now_string)
+          # A thread with no leased connection has no open transaction —
+          # checking through active_connection avoids leasing a pool
+          # connection to every concurrent enqueuer for the wait's duration
+          return nil if connection_pool.active_connection&.transaction_open?
+
+          scheduled = attributes["scheduled_at"] && attributes["scheduled_at"].getutc.strftime("%Y-%m-%d %H:%M:%S.%6N")
+          EnqueueCoordinator.enqueue(attributes, scheduled)
+        end
+
+        public
+
         # Each thread owns its client: concurrent enqueuers must commit
         # concurrently so the database can group their fsyncs — a shared
         # serialized client was measured collapsing 24-thread throughput to
         # a tenth of the regular path on real-fsync hardware.
-        def mysql_fast_enqueue(attributes, now_string)
-          return nil if connection.transaction_open?
-
-          begin
-            client = fast_enqueue_mysql_client
-            begin
-              now = "'#{now_string}'"
-              scheduled = attributes["scheduled_at"] ? Time.at(attributes["scheduled_at"]).utc.strftime("'%Y-%m-%d %H:%M:%S.%6N'") : "NULL"
-              q = "'#{client.escape(attributes["queue_name"])}'"
-              result = client.query(<<~SQL)
-                BEGIN;
-                INSERT INTO solid_queue_jobs (queue_name, class_name, arguments, priority, active_job_id, scheduled_at, created_at, updated_at)
-                VALUES (#{q}, '#{client.escape(attributes["class_name"])}', '#{client.escape(attributes["arguments"])}',
-                        #{attributes["priority"].to_i}, '#{client.escape(attributes["active_job_id"])}', #{scheduled}, #{now}, #{now});
-                SET @sq_jid = LAST_INSERT_ID();
-                INSERT INTO solid_queue_ready_executions (job_id, queue_name, priority, created_at)
-                VALUES (@sq_jid, #{q}, #{attributes["priority"].to_i}, #{now});
-                COMMIT;
-                SELECT @sq_jid
-              SQL
-              while client.next_result
-                r = client.store_result
-                result = r if r
-              end
-              result&.first&.values&.first
-            rescue Mysql2::Error => e
-              begin client.query("ROLLBACK"); rescue Mysql2::Error; Thread.current[:sq_enqueue_mysql_client] = nil; end
-              raise EnqueueError.new("#{e.class.name}: #{e.message}").tap { |err| err.set_backtrace(e.backtrace) }
-            end
-          end
-        end
-
-        def fast_enqueue_mysql_client
+        def fast_enqueue_mysql_client # :nodoc:
           Thread.current[:sq_enqueue_mysql_client] ||= begin
             config = connection_pool.db_config.configuration_hash
             Mysql2::Client.new(config.merge(flags: Mysql2::Client::MULTI_STATEMENTS))
           end
         end
+
+        private
 
         def create_all_from_active_jobs(active_jobs)
           job_rows = active_jobs.map { |job| attributes_from_active_job(job) }
