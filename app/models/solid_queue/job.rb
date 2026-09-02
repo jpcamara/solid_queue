@@ -52,6 +52,17 @@ module SolidQueue
           end
         end
 
+        # Memoized from pool config: reading it through a live connection
+        # would lease one per enqueuing thread just to branch
+        def fast_enqueue_adapter
+          @fast_enqueue_adapter ||= case connection_pool.db_config.adapter
+          when "postgresql" then :postgresql
+          when /sqlite/ then :sqlite
+          when /mysql/ then :mysql
+          else :other
+          end
+        end
+
         def wrap_enqueue_errors
           yield
         rescue => e
@@ -89,10 +100,10 @@ module SolidQueue
           }
 
           id = wrap_enqueue_errors do
-            case connection.adapter_name
-            when "PostgreSQL" then pg_fast_enqueue(attributes, now_string)
-            when "SQLite" then sqlite_fast_enqueue(attributes, now_string)
-            when /mysql/i then mysql_fast_enqueue(attributes, now_string)
+            case fast_enqueue_adapter
+            when :postgresql then pg_fast_enqueue(attributes, now_string)
+            when :sqlite then sqlite_fast_enqueue(attributes, now_string)
+            when :mysql then mysql_fast_enqueue(attributes, now_string)
             end
           end
           return nil unless id
@@ -134,20 +145,16 @@ module SolidQueue
           RETURNING job_id
         SQL
 
-        # Prepared once per connection and executed raw on the caller's own
-        # connection: a single atomic statement that joins any open
-        # transaction and autocommits durably otherwise
+        # One unnamed parameterized statement on the caller's own connection —
+        # joins any open transaction, autocommits durably otherwise, and
+        # avoids named prepared statements, which transaction-pooling
+        # proxies mishandle
         def pg_fast_enqueue(attributes, now_string)
           conn = connection
           conn.materialize_transactions
           raw = conn.raw_connection
 
-          unless conn.instance_variable_get(:@sq_enqueue_prepared)
-            raw.prepare("sq_fast_enqueue", PG_ENQUEUE_SQL)
-            conn.instance_variable_set(:@sq_enqueue_prepared, true)
-          end
-
-          result = raw.exec_prepared("sq_fast_enqueue", [
+          result = raw.exec_params(PG_ENQUEUE_SQL, [
             attributes["queue_name"],
             attributes["class_name"],
             attributes["arguments"],

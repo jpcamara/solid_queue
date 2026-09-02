@@ -229,13 +229,13 @@ module SolidQueue
         when :mysql
           now = Time.current.utc.strftime("'%Y-%m-%d %H:%M:%S.%6N'")
           with_flusher_connection do |client|
-            client.query(<<~SQL)
-              BEGIN;
-              DELETE FROM solid_queue_claimed_executions WHERE job_id IN (#{ids});
-              UPDATE solid_queue_jobs SET finished_at = #{now} WHERE id IN (#{ids});
-              COMMIT
-            SQL
-            client.next_result while client.next_result
+            client.query("BEGIN")
+            client.query("DELETE FROM solid_queue_claimed_executions WHERE job_id IN (#{ids})")
+            client.query("UPDATE solid_queue_jobs SET finished_at = #{now} WHERE id IN (#{ids})")
+            client.query("COMMIT")
+          rescue Mysql2::Error
+            begin client.query("ROLLBACK"); rescue Mysql2::Error; end
+            raise
           end
         else
           connection = flusher_ar_connection
@@ -287,7 +287,7 @@ module SolidQueue
           PG.connect({ dbname: config[:database], host: config[:host], port: config[:port],
                        user: config[:username], password: config[:password] }.compact)
         else
-          Mysql2::Client.new(config.merge(flags: Mysql2::Client::MULTI_STATEMENTS))
+          Mysql2::Client.new(config)
         end
       end
   end

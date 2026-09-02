@@ -124,10 +124,10 @@ module SolidQueue
         e
       end
 
-      # One multi-statement round trip: a single multi-row insert is a
-      # "simple insert", so InnoDB allocates its auto-increment ids
-      # consecutively in every autoinc lock mode and LAST_INSERT_ID returns
-      # the first id of the batch.
+      # Plain statements inside one transaction, safe through any proxy or
+      # pooler. A single multi-row insert is a "simple insert", so InnoDB
+      # allocates its auto-increment ids consecutively in every autoinc lock
+      # mode and LAST_INSERT_ID returns the first id of the batch.
       def write_batch(entries)
         with_client do |client|
           write_batch_on(client, entries)
@@ -146,7 +146,7 @@ module SolidQueue
           if client.nil? && @client_count < 4
             @client_count += 1
             config = Job.connection_pool.db_config.configuration_hash
-            client = Mysql2::Client.new(config.merge(flags: Mysql2::Client::MULTI_STATEMENTS))
+            client = Mysql2::Client.new(config)
           end
         end
         client ||= begin
@@ -170,26 +170,15 @@ module SolidQueue
             "#{a["priority"].to_i}, '#{client.escape(a["active_job_id"])}', #{scheduled}, '#{now}', '#{now}')"
         end.join(",")
 
+        client.query("BEGIN")
+        client.query("INSERT INTO solid_queue_jobs (queue_name, class_name, arguments, priority, active_job_id, scheduled_at, created_at, updated_at) VALUES #{job_rows}")
+        first_id = client.query("SELECT LAST_INSERT_ID()").first.values.first.to_i
         ready_rows = entries.each_index.map do |i|
           a = entries[i].attributes
-          "(@sq_first + #{i}, '#{client.escape(a["queue_name"])}', #{a["priority"].to_i}, '#{now}')"
+          "(#{first_id + i}, '#{client.escape(a["queue_name"])}', #{a["priority"].to_i}, '#{now}')"
         end.join(",")
-
-        result = client.query(<<~SQL)
-          BEGIN;
-          INSERT INTO solid_queue_jobs (queue_name, class_name, arguments, priority, active_job_id, scheduled_at, created_at, updated_at)
-          VALUES #{job_rows};
-          SET @sq_first = LAST_INSERT_ID();
-          INSERT INTO solid_queue_ready_executions (job_id, queue_name, priority, created_at)
-          VALUES #{ready_rows};
-          COMMIT;
-          SELECT @sq_first
-        SQL
-        while client.next_result
-          r = client.store_result
-          result = r if r
-        end
-        first_id = result.first.values.first.to_i
+        client.query("INSERT INTO solid_queue_ready_executions (job_id, queue_name, priority, created_at) VALUES #{ready_rows}")
+        client.query("COMMIT")
         entries.each_index.map { |i| first_id + i }
       rescue Mysql2::Error => e
         begin client.query("ROLLBACK"); rescue Mysql2::Error; end

@@ -80,11 +80,13 @@ module SolidQueue
         claim_mysql_mutex.synchronize do
           client = claim_mysql_client
           begin
-            result = client.query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED; BEGIN; #{select_sql}", cache_rows: false)
-            while client.next_result
-              r = client.store_result
-              result = r if r
-            end
+            # Sent as plain statements so any proxy or pooler passes them
+            # through. If a pooler splits the isolation hint from the
+            # transaction it silently degrades to REPEATABLE READ — still
+            # correct, only slower under contention.
+            client.query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
+            client.query("BEGIN")
+            result = client.query(select_sql, cache_rows: false)
 
             if result.nil? || result.count.zero?
               client.query("ROLLBACK")
@@ -101,12 +103,9 @@ module SolidQueue
             end
 
             values = claimed.map { |_, e| "(#{e.job_id}, #{process_id ? process_id.to_i : "NULL"}, #{now})" }.join(",")
-            client.query(<<~SQL)
-              INSERT INTO solid_queue_claimed_executions (job_id, process_id, created_at) VALUES #{values};
-              DELETE FROM solid_queue_ready_executions WHERE id IN (#{claimed.map(&:first).join(",")});
-              COMMIT
-            SQL
-            client.next_result while client.next_result
+            client.query("INSERT INTO solid_queue_claimed_executions (job_id, process_id, created_at) VALUES #{values}")
+            client.query("DELETE FROM solid_queue_ready_executions WHERE id IN (#{claimed.map(&:first).join(",")})")
+            client.query("COMMIT")
 
             claimed.map(&:last)
           rescue Exception
@@ -129,7 +128,7 @@ module SolidQueue
       def claim_mysql_client
         @claim_mysql_client ||= begin
           config = connection_pool.db_config.configuration_hash
-          Mysql2::Client.new(config.merge(flags: Mysql2::Client::MULTI_STATEMENTS))
+          Mysql2::Client.new(config)
         end
       end
 
@@ -193,20 +192,11 @@ module SolidQueue
       end
 
 
-      # PREPARE the claim once per connection and shape: the CTE is large and
-      # re-parsing and re-planning it every poll costs more than running it
+      # A plain statement every poll: session-level PREPARE breaks through
+      # transaction-pooling proxies, and re-parsing the CTE costs a few
+      # percent that portability is worth
       def execute_prepared_claim(sql, shape_key)
-        conn = connection
-        prepared = conn.instance_variable_get(:@sq_prepared_claims) || conn.instance_variable_set(:@sq_prepared_claims, {})
-        name = prepared[shape_key]
-
-        unless name
-          name = "sq_claim_#{prepared.size}"
-          conn.execute("PREPARE #{name} AS #{sql}")
-          prepared[shape_key] = name
-        end
-
-        conn.select_all("EXECUTE #{name}")
+        connection.select_all(sql)
       end
 
       # The same rows, locks and atomicity as select_and_lock + claiming, in
