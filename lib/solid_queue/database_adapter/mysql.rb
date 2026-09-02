@@ -33,14 +33,47 @@ module SolidQueue
         end
       end
 
-      # A single multi-row insert is a "simple insert", so InnoDB allocates
-      # its auto-increment ids consecutively in every autoinc lock mode and
-      # LAST_INSERT_ID reports the first id of the batch
-      def insert_jobs_returning_ids(job_rows)
-        Job.insert_all!(job_rows)
-        first = Job.connection.select_value("SELECT LAST_INSERT_ID()").to_i
-        (first...(first + job_rows.size)).to_a
+      # Four exchanges, the minimum for two atomic inserts without a
+      # multi-statement packet: BEGIN, the jobs insert, the ready insert,
+      # COMMIT. The jobs insert is a "simple insert", so InnoDB allocates
+      # its auto-increment ids consecutively in every autoinc lock mode,
+      # and the OK packet the insert already returns carries the first id,
+      # which Active Record hands back from `insert` — no LAST_INSERT_ID
+      # round trip. Each insert is one lean Arel statement rather than the
+      # bulk API's per-call builder.
+      def write_enqueue_batch(job_rows, now)
+        Job.transaction do
+          count_batched(job_rows)
+          first = Job.connection.insert(insert_manager(Job, job_rows.map { |row| job_values(row, now) }), "SolidQueue::Job Create", "id")
+          ids = (first...(first + job_rows.size)).to_a
+          Job.connection.insert(insert_manager(ReadyExecution, job_rows.each_with_index.map { |row, i|
+            { job_id: ids[i], queue_name: row[:queue_name], priority: row[:priority], created_at: now }
+          }), "SolidQueue::ReadyExecution Create", "id")
+          track_batched(job_rows, ids, now)
+          ids
+        end
       end
+
+      private
+        def job_values(row, now)
+          values = {
+            queue_name: row[:queue_name], class_name: row[:class_name],
+            arguments: Job.type_for_attribute("arguments").serialize(row[:arguments]), priority: row[:priority],
+            active_job_id: row[:active_job_id], scheduled_at: row[:scheduled_at], created_at: now, updated_at: now
+          }
+          values[:batch_id] = row[:batch_id] if row.key?(:batch_id)
+          values
+        end
+
+        def insert_manager(model, rows)
+          table = model.arel_table
+          columns = rows.first.keys
+          Arel::InsertManager.new(table).tap do |manager|
+            manager.into(table)
+            columns.each { |column| manager.columns << table[column] }
+            manager.values = manager.create_values_list(rows.map { |row| row.values_at(*columns) })
+          end
+        end
     end
   end
 end
