@@ -52,21 +52,6 @@ module SolidQueue
           end
         end
 
-        public
-
-        # Memoized from pool config: reading it through a live connection
-        # would lease one per enqueuing thread just to branch
-        def fast_enqueue_adapter # :nodoc:
-          @fast_enqueue_adapter ||= case connection_pool.db_config.adapter
-          when "postgresql" then :postgresql
-          when /sqlite/ then :sqlite
-          when /mysql/ then :mysql
-          else :other
-          end
-        end
-
-        private
-
         def wrap_enqueue_errors
           yield
         rescue ActiveRecord::ActiveRecordError => e
@@ -93,7 +78,7 @@ module SolidQueue
           return nil if scheduled_at && scheduled_at > now
           return nil if active_job.respond_to?(:concurrency_key) && active_job.concurrency_key
           return nil if active_job.respond_to?(:batch_id) && active_job.batch_id
-          return nil if fast_enqueue_adapter == :other
+          return nil unless DatabaseAdapter.resolve.fast_paths?
           return nil if connection_pool.active_connection&.transaction_open?
 
           attributes = {

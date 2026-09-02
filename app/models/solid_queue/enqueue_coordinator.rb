@@ -1,5 +1,7 @@
 # frozen_string_literal: true
 
+require "singleton"
+
 module SolidQueue
   # Group commit for fast-path enqueues on databases where durable commits
   # are expensive: concurrent enqueuers share one batched insert transaction,
@@ -8,13 +10,11 @@ module SolidQueue
   # writes every collected job in a single round trip. A failed batch is
   # retried entry by entry so each error reaches the caller that owns it.
   class EnqueueCoordinator
+    include Singleton
+
     Entry = Struct.new(:attributes, :scheduled, :waiter)
 
     class << self
-      def instance
-        @instance ||= new
-      end
-
       def enqueue(attributes, scheduled) = instance.enqueue(attributes, scheduled)
     end
 
@@ -22,7 +22,9 @@ module SolidQueue
       @mutex = Mutex.new
       @pending = nil
       @leading = false
-      @pace = 0.0
+      # Racy reads by design: any recently committed batch's duration is a
+      # valid pace, so an atomic reference is all the synchronization needed
+      @pace = Concurrent::AtomicReference.new(0.0)
     end
 
     def enqueue(attributes, scheduled)
@@ -62,7 +64,7 @@ module SolidQueue
       CHEAP_COMMIT = 0.002
 
       def collect_burst
-        pace = @pace
+        pace = @pace.get
         return if pace < CHEAP_COMMIT
 
         window = pace / 2
@@ -92,7 +94,8 @@ module SolidQueue
           error = e
         end
         duration = ::Process.clock_gettime(::Process::CLOCK_MONOTONIC) - started
-        @pace = @pace.zero? ? duration : @pace * 0.8 + duration * 0.2
+        previous = @pace.get
+        @pace.set(previous.zero? ? duration : previous * 0.8 + duration * 0.2)
 
         next_entries = nil
         @mutex.synchronize do
@@ -141,42 +144,23 @@ module SolidQueue
         end
 
         Job.connection_pool.with_connection do
-          if sqlite?
-            SqliteWriterFunnel.acquire(Job.connection_pool) { insert_batch(entries, job_rows, now) }
-          else
-            insert_batch(entries, job_rows, now)
-          end
+          adapter.serialize_writes { insert_batch(entries, job_rows, now) }
         end
+      end
+
+      def adapter
+        @adapter ||= DatabaseAdapter.resolve
       end
 
       def insert_batch(entries, job_rows, now)
         Job.transaction do
-          ids = insert_jobs_returning_ids(job_rows)
+          ids = adapter.insert_jobs_returning_ids(job_rows)
           ReadyExecution.insert_all!(entries.each_index.map { |i|
             { job_id: ids[i], queue_name: job_rows[i][:queue_name],
               priority: job_rows[i][:priority], created_at: now }
           })
           ids
         end
-      end
-
-      def insert_jobs_returning_ids(job_rows)
-        case Job.fast_enqueue_adapter
-        when :postgresql
-          Job.insert_all!(job_rows, returning: [ :id ]).rows.map(&:first)
-        when :mysql
-          Job.insert_all!(job_rows)
-          first = Job.connection.select_value("SELECT LAST_INSERT_ID()").to_i
-          (first...(first + job_rows.size)).to_a
-        else
-          Job.insert_all!(job_rows)
-          last = Job.connection.select_value("SELECT last_insert_rowid()").to_i
-          ((last - job_rows.size + 1)..last).to_a
-        end
-      end
-
-      def sqlite?
-        Job.fast_enqueue_adapter == :sqlite
       end
   end
 end

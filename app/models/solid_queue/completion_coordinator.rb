@@ -1,5 +1,7 @@
 # frozen_string_literal: true
 
+require "singleton"
+
 module SolidQueue
   # Group commit for plain-job completions, driven by a dedicated flusher
   # thread per process. Completing threads enqueue their job and block until
@@ -9,22 +11,23 @@ module SolidQueue
   # to the flush latency automatically and keeps claiming and flushing
   # overlapped instead of convoying.
   class CompletionCoordinator
+    include Singleton
+
     Batch = Struct.new(:job_ids, :waiters)
 
     class << self
-      def instance
-        @instance ||= new
-      end
-
       def finish(execution) = instance.finish(execution)
     end
 
     def initialize
       @mutex = Mutex.new
-      @work_cv = ConditionVariable.new
+      @work = Thread::Queue.new
       @pending = nil
       @flushing = 0
-      @flush_pace = 0.0
+      # Written by one leader at a time and read racily by arriving threads;
+      # any recently written value is valid, so an atomic reference is all
+      # the synchronization the pace needs
+      @flush_pace = Concurrent::AtomicReference.new(0.0)
     end
 
     # The first completion to arrive while no flush is running flushes
@@ -32,7 +35,7 @@ module SolidQueue
     # up and are flushed by the next arrival (or themselves), so batches size
     # to flush latency with zero idle gaps.
     def finish(execution)
-      return threaded_finish(execution) if adapter == :other
+      return threaded_finish(execution) if adapter.dedicated_flusher?
 
       my_batch = nil
       lead = false
@@ -40,6 +43,9 @@ module SolidQueue
       waiter = nil
       @mutex.synchronize do
         if @flushing >= max_inflight_flushes
+          # A reused thread-local queue outperforms a promise per completion
+          # at queue throughput rates — measured, not assumed: promise-based
+          # dispatch was removed from this hot path for exactly that reason
           waiter = (Thread.current[:sq_completion_waiter] ||= Thread::Queue.new)
           my_batch = (@pending ||= Batch.new([], []))
           my_batch.job_ids << execution.job_id
@@ -94,6 +100,10 @@ module SolidQueue
         MAX_INFLIGHT_FLUSHES
       end
 
+      def flush_pace
+        @flush_pace.get
+      end
+
       def collect_window_for(pace)
         if pace < CHEAP_FLUSH
           pace > 0.0012 ? 0.0012 : pace
@@ -108,7 +118,7 @@ module SolidQueue
       # claim burst commit together instead of one commit each. Promoted
       # leaders flush back-to-back and their batches size themselves.
       def pace_and_collect(my_batch)
-        pace = @flush_pace
+        pace = flush_pace
         return unless pace > 0
 
         if pace < CHEAP_FLUSH
@@ -139,20 +149,17 @@ module SolidQueue
 
       def record_flush_pace(started, finished)
         duration = finished - started
-        @flush_pace = @flush_pace.zero? ? duration : @flush_pace * 0.8 + duration * 0.2
+        previous = @flush_pace.get
+        @flush_pace.set(previous.zero? ? duration : previous * 0.8 + duration * 0.2)
       end
 
       # Single-writer databases do best with a single writer thread: pool
-      # threads queue their completions and one flusher owns all the flushing
+      # threads push their completions onto a queue and one flusher owns all
+      # the flushing, draining whatever has accumulated into each batch
       def threaded_finish(execution)
+        ensure_flusher
         waiter = (Thread.current[:sq_completion_waiter] ||= Thread::Queue.new)
-        @mutex.synchronize do
-          ensure_flusher
-          batch = (@pending ||= Batch.new([], []))
-          batch.job_ids << execution.job_id
-          batch.waiters << waiter
-          @work_cv.signal
-        end
+        @work.push([ execution.job_id, waiter ])
         error = waiter.pop
         raise error if error
       end
@@ -160,25 +167,25 @@ module SolidQueue
       def ensure_flusher
         return if @flusher&.alive?
 
-        @flusher = Thread.new do
-          loop do
-            batch = nil
-            @mutex.synchronize do
-              @work_cv.wait(@mutex) while @pending.nil?
-              batch = @pending
-              @pending = nil
-            end
+        @mutex.synchronize do
+          next if @flusher&.alive?
 
-            error = nil
-            begin
-              flush(batch.job_ids)
-            rescue => e
-              error = e
+          @flusher = Thread.new do
+            loop do
+              entries = [ @work.pop ]
+              entries << @work.pop until @work.empty?
+
+              error = nil
+              begin
+                flush(entries.map(&:first))
+              rescue => e
+                error = e
+              end
+              entries.each { |_, waiter| waiter.push(error) }
             end
-            batch.waiters.each { |follower| follower.push(error) }
           end
+          @flusher.name = "solid_queue_completion_flusher"
         end
-        @flusher.name = "solid_queue_completion_flusher"
       end
 
       # Flush one batch, then hand any batch that accumulated meanwhile to
@@ -206,45 +213,14 @@ module SolidQueue
         error
       end
 
-      # One atomic flush per batch: the claimed rows disappear and their jobs
-      # finish in the same transaction, so a batch is either fully durable or
-      # not there at all. SQLite writes go through the writer funnel like
-      # every other write in the process.
+      # Each batch flushes atomically through the database adapter: either
+      # the whole batch is durable and finished, or none of it is
       def flush(job_ids)
-        if adapter == :other
-          SqliteWriterFunnel.acquire(ClaimedExecution.connection_pool) do
-            flush_batch(job_ids)
-          end
-        else
-          flush_batch(job_ids)
-        end
-      end
-
-      def flush_batch(job_ids)
-        if adapter == :postgresql
-          # One atomic statement: the delete and the finish share a snapshot
-          # and a commit without transaction round trips
-          Job.connection.exec_update(<<~SQL)
-            WITH deleted AS (
-              DELETE FROM solid_queue_claimed_executions WHERE job_id IN (#{job_ids.join(",")}) RETURNING job_id
-            )
-            UPDATE solid_queue_jobs SET finished_at = now()
-            WHERE id IN (SELECT job_id FROM deleted)
-          SQL
-        else
-          ClaimedExecution.transaction do
-            ClaimedExecution.where(job_id: job_ids).delete_all
-            Job.where(id: job_ids).update_all(finished_at: Time.current)
-          end
-        end
+        adapter.flush_completions(job_ids)
       end
 
       def adapter
-        @adapter ||= case ClaimedExecution.connection_pool.db_config.adapter
-        when "postgresql" then :postgresql
-        when /mysql/ then :mysql
-        else :other
-        end
+        @adapter ||= DatabaseAdapter.resolve
       end
   end
 end
