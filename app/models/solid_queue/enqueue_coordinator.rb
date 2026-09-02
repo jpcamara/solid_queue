@@ -124,65 +124,59 @@ module SolidQueue
         e
       end
 
-      # Plain statements inside one transaction, safe through any proxy or
-      # pooler. A single multi-row insert is a "simple insert", so InnoDB
-      # allocates its auto-increment ids consecutively in every autoinc lock
-      # mode and LAST_INSERT_ID returns the first id of the batch.
+      # One transaction per batch, written with Active Record's bulk API on
+      # a briefly checked-out connection. A single multi-row insert receives
+      # consecutive auto-increment ids on MySQL (simple inserts allocate in
+      # one chunk in every autoinc lock mode) and consecutive rowids on
+      # SQLite (single writer), so the whole batch's ids follow from one
+      # value; PostgreSQL simply returns them.
       def write_batch(entries)
-        with_client do |client|
-          write_batch_on(client, entries)
+        now = Time.current
+        job_rows = entries.map do |entry|
+          attributes = entry.attributes
+          { queue_name: attributes["queue_name"], class_name: attributes["class_name"],
+            arguments: attributes["arguments"], priority: attributes["priority"],
+            active_job_id: attributes["active_job_id"], scheduled_at: entry.scheduled,
+            created_at: now, updated_at: now }
         end
-      end
 
-      # Only one leader writes at a time (plus a promotion in flight), so a
-      # small borrowed pool serves any number of enqueuing threads without
-      # holding a connection per thread
-      def with_client
-        client = nil
-        @mutex.synchronize do
-          @clients ||= []
-          @client_count ||= 0
-          client = @clients.pop
-          if client.nil? && @client_count < 4
-            @client_count += 1
-            config = Job.connection_pool.db_config.configuration_hash
-            client = Mysql2::Client.new(config)
+        Job.connection_pool.with_connection do
+          if sqlite?
+            SqliteWriterFunnel.acquire(Job.connection_pool) { insert_batch(entries, job_rows, now) }
+          else
+            insert_batch(entries, job_rows, now)
           end
         end
-        client ||= begin
-          sleep 0.001 until (client = @mutex.synchronize { @clients.pop })
-          client
-        end
-        begin
-          yield client
-        ensure
-          @mutex.synchronize { @clients.push(client) }
+      end
+
+      def insert_batch(entries, job_rows, now)
+        Job.transaction do
+          ids = insert_jobs_returning_ids(job_rows)
+          ReadyExecution.insert_all!(entries.each_index.map { |i|
+            { job_id: ids[i], queue_name: job_rows[i][:queue_name],
+              priority: job_rows[i][:priority], created_at: now }
+          })
+          ids
         end
       end
 
-      def write_batch_on(client, entries)
-        now = Job.fast_enqueue_timestamp(Time.now)
+      def insert_jobs_returning_ids(job_rows)
+        case Job.fast_enqueue_adapter
+        when :postgresql
+          Job.insert_all!(job_rows, returning: [ :id ]).rows.map(&:first)
+        when :mysql
+          Job.insert_all!(job_rows)
+          first = Job.connection.select_value("SELECT LAST_INSERT_ID()").to_i
+          (first...(first + job_rows.size)).to_a
+        else
+          Job.insert_all!(job_rows)
+          last = Job.connection.select_value("SELECT last_insert_rowid()").to_i
+          ((last - job_rows.size + 1)..last).to_a
+        end
+      end
 
-        job_rows = entries.map do |entry|
-          a = entry.attributes
-          scheduled = entry.scheduled ? "'#{client.escape(entry.scheduled)}'" : "NULL"
-          "('#{client.escape(a["queue_name"])}', '#{client.escape(a["class_name"])}', '#{client.escape(a["arguments"])}', " \
-            "#{a["priority"].to_i}, '#{client.escape(a["active_job_id"])}', #{scheduled}, '#{now}', '#{now}')"
-        end.join(",")
-
-        client.query("BEGIN")
-        client.query("INSERT INTO solid_queue_jobs (queue_name, class_name, arguments, priority, active_job_id, scheduled_at, created_at, updated_at) VALUES #{job_rows}")
-        first_id = client.query("SELECT LAST_INSERT_ID()").first.values.first.to_i
-        ready_rows = entries.each_index.map do |i|
-          a = entries[i].attributes
-          "(#{first_id + i}, '#{client.escape(a["queue_name"])}', #{a["priority"].to_i}, '#{now}')"
-        end.join(",")
-        client.query("INSERT INTO solid_queue_ready_executions (job_id, queue_name, priority, created_at) VALUES #{ready_rows}")
-        client.query("COMMIT")
-        entries.each_index.map { |i| first_id + i }
-      rescue Mysql2::Error => e
-        begin client.query("ROLLBACK"); rescue Mysql2::Error; end
-        raise Job::EnqueueError.new("#{e.class.name}: #{e.message}").tap { |err| err.set_backtrace(e.backtrace) }
+      def sqlite?
+        Job.fast_enqueue_adapter == :sqlite
       end
   end
 end

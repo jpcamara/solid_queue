@@ -52,9 +52,11 @@ module SolidQueue
           end
         end
 
+        public
+
         # Memoized from pool config: reading it through a live connection
         # would lease one per enqueuing thread just to branch
-        def fast_enqueue_adapter
+        def fast_enqueue_adapter # :nodoc:
           @fast_enqueue_adapter ||= case connection_pool.db_config.adapter
           when "postgresql" then :postgresql
           when /sqlite/ then :sqlite
@@ -63,14 +65,11 @@ module SolidQueue
           end
         end
 
+        private
+
         def wrap_enqueue_errors
           yield
-        rescue => e
-          raise unless e.is_a?(ActiveRecord::ActiveRecordError) ||
-            (defined?(SQLite3::Exception) && e.is_a?(SQLite3::Exception)) ||
-            (defined?(Mysql2::Error) && e.is_a?(Mysql2::Error)) ||
-            (defined?(PG::Error) && e.is_a?(PG::Error))
-
+        rescue ActiveRecord::ActiveRecordError => e
           enqueue_error = EnqueueError.new("#{e.class.name}: #{e.message}").tap do |error|
             error.set_backtrace e.backtrace
           end
@@ -82,155 +81,43 @@ module SolidQueue
         # ceremony — on the caller's own connection, so surrounding
         # transactions and rollbacks behave identically. Anything else (or an
         # unrecognized adapter) declines and takes the regular path.
+        # A plain, immediate, unbatched job enqueued outside any caller
+        # transaction goes through the enqueue coordinator: the same two rows
+        # the regular path creates, written with the bulk insert API in one
+        # transaction that concurrent enqueuers share. Everything else takes
+        # the regular path, including callers inside transactions, whose
+        # writes must ride their own connection.
         def single_statement_enqueue(active_job)
           now = Time.now
           scheduled_at = active_job.scheduled_at
           return nil if scheduled_at && scheduled_at > now
           return nil if active_job.respond_to?(:concurrency_key) && active_job.concurrency_key
           return nil if active_job.respond_to?(:batch_id) && active_job.batch_id
+          return nil if fast_enqueue_adapter == :other
+          return nil if connection_pool.active_connection&.transaction_open?
 
-          now_string = fast_enqueue_timestamp(now)
           attributes = {
             "queue_name" => active_job.queue_name || DEFAULT_QUEUE_NAME,
             "class_name" => active_job.class.name,
-            "arguments" => JSON.dump(active_job.serialize),
+            "arguments" => active_job.serialize,
             "priority" => active_job.priority || DEFAULT_PRIORITY,
             "active_job_id" => active_job.job_id,
             "scheduled_at" => scheduled_at
           }
 
           id = wrap_enqueue_errors do
-            case fast_enqueue_adapter
-            when :postgresql then pg_fast_enqueue(attributes, now_string)
-            when :sqlite then sqlite_fast_enqueue(attributes, now_string)
-            when :mysql then mysql_fast_enqueue(attributes, now_string)
-            end
+            EnqueueCoordinator.enqueue(attributes, scheduled_at)
           end
           return nil unless id
 
+          # instantiate expects database form, so the arguments hash goes in
+          # the way the JSON coder stored it
           instantiate(attributes.merge(
-            "id" => id, "finished_at" => nil, "concurrency_key" => nil,
-            "created_at" => now_string, "updated_at" => now_string
+            "id" => id, "arguments" => JSON.dump(attributes["arguments"]),
+            "finished_at" => nil, "concurrency_key" => nil,
+            "created_at" => now, "updated_at" => now
           ))
         end
-
-        public
-
-        # The database timestamp format Active Record uses, with the
-        # formatted prefix reused within the same second. A concurrently
-        # written cache entry is valid for its own second either way.
-        def fast_enqueue_timestamp(now) # :nodoc:
-          utc = now.getutc
-          sec = utc.to_i
-          cached_sec, prefix = @fast_enqueue_ts_cache
-
-          unless sec == cached_sec
-            prefix = utc.strftime("%Y-%m-%d %H:%M:%S.")
-            @fast_enqueue_ts_cache = [ sec, prefix ].freeze
-          end
-
-          format("%s%06d", prefix, utc.usec)
-        end
-
-        private
-
-        PG_ENQUEUE_SQL = <<~SQL
-          WITH job AS (
-            INSERT INTO solid_queue_jobs (queue_name, class_name, arguments, priority, active_job_id, scheduled_at, created_at, updated_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $7)
-            RETURNING id
-          )
-          INSERT INTO solid_queue_ready_executions (job_id, queue_name, priority, created_at)
-          SELECT id, $1, $4, $7 FROM job
-          RETURNING job_id
-        SQL
-
-        # One unnamed parameterized statement on the caller's own connection —
-        # joins any open transaction, autocommits durably otherwise, and
-        # avoids named prepared statements, which transaction-pooling
-        # proxies mishandle
-        def pg_fast_enqueue(attributes, now_string)
-          conn = connection
-          conn.materialize_transactions
-          raw = conn.raw_connection
-
-          result = raw.exec_params(PG_ENQUEUE_SQL, [
-            attributes["queue_name"],
-            attributes["class_name"],
-            attributes["arguments"],
-            attributes["priority"],
-            attributes["active_job_id"],
-            attributes["scheduled_at"] && conn.quoted_date(attributes["scheduled_at"]),
-            now_string
-          ])
-          result.ntuples == 1 ? result.getvalue(0, 0).to_i : nil
-        end
-
-        def sqlite_fast_enqueue(attributes, now_string)
-          conn = connection
-          scheduled = attributes["scheduled_at"] ? conn.quote(attributes["scheduled_at"]) : "NULL"
-          insert_sql = "INSERT INTO solid_queue_jobs (queue_name, class_name, arguments, priority, active_job_id, scheduled_at, created_at, updated_at) " \
-            "VALUES (#{conn.quote(attributes["queue_name"])}, #{conn.quote(attributes["class_name"])}, #{conn.quote(attributes["arguments"])}, " \
-            "#{attributes["priority"].to_i}, #{conn.quote(attributes["active_job_id"])}, #{scheduled}, '#{now_string}', '#{now_string}')"
-
-          id = nil
-          SolidQueue::SqliteWriterFunnel.acquire(connection_pool) do
-            if conn.transaction_open?
-              transaction do
-                conn.materialize_transactions
-                id = sqlite_fast_insert(conn, insert_sql, attributes, now_string)
-              end
-            else
-              raw = conn.raw_connection
-              begin
-                raw.execute("BEGIN IMMEDIATE")
-                id = sqlite_fast_insert(conn, insert_sql, attributes, now_string)
-                raw.execute("COMMIT")
-              rescue Exception
-                begin raw.execute("ROLLBACK"); rescue SQLite3::Exception; end
-                raise
-              end
-            end
-          end
-          id
-        end
-
-        def sqlite_fast_insert(conn, insert_sql, attributes, now_string)
-          conn.execute(insert_sql)
-          id = conn.select_value("SELECT last_insert_rowid()")
-          conn.execute("INSERT INTO solid_queue_ready_executions (job_id, queue_name, priority, created_at) " \
-            "VALUES (#{id}, #{conn.quote(attributes["queue_name"])}, #{attributes["priority"].to_i}, '#{now_string}')")
-          id
-        end
-
-        # Routed through the enqueue coordinator: concurrent enqueuers share
-        # one batched insert transaction (each still returning only after
-        # that durable commit), and a lone enqueuer is simply a batch of one.
-        # Only used outside caller transactions, which the regular path serves.
-        def mysql_fast_enqueue(attributes, now_string)
-          # A thread with no leased connection has no open transaction —
-          # checking through active_connection avoids leasing a pool
-          # connection to every concurrent enqueuer for the wait's duration
-          return nil if connection_pool.active_connection&.transaction_open?
-
-          scheduled = attributes["scheduled_at"] && attributes["scheduled_at"].getutc.strftime("%Y-%m-%d %H:%M:%S.%6N")
-          EnqueueCoordinator.enqueue(attributes, scheduled)
-        end
-
-        public
-
-        # Each thread owns its client: concurrent enqueuers must commit
-        # concurrently so the database can group their fsyncs — a shared
-        # serialized client was measured collapsing 24-thread throughput to
-        # a tenth of the regular path on real-fsync hardware.
-        def fast_enqueue_mysql_client # :nodoc:
-          Thread.current[:sq_enqueue_mysql_client] ||= begin
-            config = connection_pool.db_config.configuration_hash
-            Mysql2::Client.new(config.merge(flags: Mysql2::Client::MULTI_STATEMENTS))
-          end
-        end
-
-        private
 
         def create_all_from_active_jobs(active_jobs)
           job_rows = active_jobs.map { |job| attributes_from_active_job(job) }

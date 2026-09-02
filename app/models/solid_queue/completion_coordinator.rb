@@ -24,9 +24,6 @@ module SolidQueue
       @work_cv = ConditionVariable.new
       @pending = nil
       @flushing = 0
-      @pool_mutex = Mutex.new
-      @flusher_pool = Thread::Queue.new
-      @flusher_pool_size = 0
       @flush_pace = 0.0
     end
 
@@ -209,43 +206,24 @@ module SolidQueue
         error
       end
 
-      # Flushers own persistent raw connections, one per in-flight flush: no
-      # pool checkout per flush, and on MySQL a multi-statement client sends
-      # the entire atomic flush in a single round trip
+      # One atomic flush per batch: the claimed rows disappear and their jobs
+      # finish in the same transaction, so a batch is either fully durable or
+      # not there at all. SQLite writes go through the writer funnel like
+      # every other write in the process.
       def flush(job_ids)
-        ids = job_ids.join(",")
-
-        case adapter
-        when :postgresql
-          with_flusher_connection do |conn|
-            conn.exec(<<~SQL)
-              WITH deleted AS (
-                DELETE FROM solid_queue_claimed_executions WHERE job_id IN (#{ids}) RETURNING job_id
-              )
-              UPDATE solid_queue_jobs SET finished_at = now()
-              WHERE id IN (SELECT job_id FROM deleted)
-            SQL
-          end
-        when :mysql
-          now = Time.current.utc.strftime("'%Y-%m-%d %H:%M:%S.%6N'")
-          with_flusher_connection do |client|
-            client.query("BEGIN")
-            client.query("DELETE FROM solid_queue_claimed_executions WHERE job_id IN (#{ids})")
-            client.query("UPDATE solid_queue_jobs SET finished_at = #{now} WHERE id IN (#{ids})")
-            client.query("COMMIT")
-          rescue Mysql2::Error
-            begin client.query("ROLLBACK"); rescue Mysql2::Error; end
-            raise
+        if adapter == :other
+          SqliteWriterFunnel.acquire(ClaimedExecution.connection_pool) do
+            flush_batch(job_ids)
           end
         else
-          connection = flusher_ar_connection
-          now = connection.quote(Time.current)
-          SqliteWriterFunnel.acquire(ClaimedExecution.connection_pool) do
-            connection.transaction do
-              connection.execute("DELETE FROM solid_queue_claimed_executions WHERE job_id IN (#{ids})")
-              connection.execute("UPDATE solid_queue_jobs SET finished_at = #{now} WHERE id IN (#{ids})")
-            end
-          end
+          flush_batch(job_ids)
+        end
+      end
+
+      def flush_batch(job_ids)
+        ClaimedExecution.transaction do
+          ClaimedExecution.where(job_id: job_ids).delete_all
+          Job.where(id: job_ids).update_all(finished_at: Time.current)
         end
       end
 
@@ -254,37 +232,6 @@ module SolidQueue
         when "postgresql" then :postgresql
         when /mysql/ then :mysql
         else :other
-        end
-      end
-
-      def flusher_ar_connection
-        @flusher_ar_connection ||= ClaimedExecution.connection_pool.checkout
-      end
-
-      def with_flusher_connection
-        conn = nil
-        @pool_mutex.synchronize do
-          if @flusher_pool.empty? && @flusher_pool_size < MAX_INFLIGHT_FLUSHES
-            @flusher_pool_size += 1
-            conn = new_flusher_connection
-          end
-        end
-        conn ||= @flusher_pool.pop
-        begin
-          yield conn
-        ensure
-          @flusher_pool.push(conn)
-        end
-      end
-
-      def new_flusher_connection
-        config = ClaimedExecution.connection_pool.db_config.configuration_hash
-
-        if adapter == :postgresql
-          PG.connect({ dbname: config[:database], host: config[:host], port: config[:port],
-                       user: config[:username], password: config[:password] }.compact)
-        else
-          Mysql2::Client.new(config)
         end
       end
   end

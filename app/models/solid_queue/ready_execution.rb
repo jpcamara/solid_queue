@@ -57,16 +57,15 @@ module SolidQueue
       end
 
       # Same rows and locks as select_and_lock + claiming: candidates locked
-      # with SKIP LOCKED (only the ready rows, via FOR UPDATE OF), jobs read in
-      # the same query, then two raw statements move them ready -> claimed.
-      # A multi-statement client runs the whole transaction in two round trips.
+      # with SKIP LOCKED (only the ready rows, via FOR UPDATE OF), jobs read
+      # in the same query, then moved ready -> claimed with bulk writes in
+      # the same transaction. READ COMMITTED skips the gap locks REPEATABLE
+      # READ adds to the ordered range scan, which serialize concurrent
+      # claimers against enqueuers on the index head.
       def mysql_claim(queue_relation, process_id, limit)
         return [] if limit <= 0
 
         conditions = queue_relation.where_clause.any? ? "WHERE #{queue_relation.where_clause.ast.to_sql}" : ""
-        # Same row locks on the rows we take; READ COMMITTED skips the gap
-        # locks REPEATABLE READ adds to the ordered range scan, which serialize
-        # concurrent claimers against enqueuers on the index head
         select_sql = <<~SQL
           SELECT re.id AS ready_id, #{hydration_columns}
           FROM solid_queue_ready_executions re
@@ -77,58 +76,30 @@ module SolidQueue
           FOR UPDATE OF re SKIP LOCKED
         SQL
 
-        claim_mysql_mutex.synchronize do
-          client = claim_mysql_client
-          begin
-            # Sent as plain statements so any proxy or pooler passes them
-            # through. If a pooler splits the isolation hint from the
-            # transaction it silently degrades to REPEATABLE READ — still
-            # correct, only slower under contention.
-            client.query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
-            client.query("BEGIN")
-            result = client.query(select_sql, cache_rows: false)
+        claimed = transaction(isolation: :read_committed) do
+          result = connection.select_all(select_sql)
+          next [] if result.rows.empty?
 
-            if result.nil? || result.count.zero?
-              client.query("ROLLBACK")
-              next []
-            end
-
-            now = Time.current.utc.strftime("'%Y-%m-%d %H:%M:%S.%6N'")
-            claimed = result.map do |attrs|
-              ready_id = attrs.delete("ready_id")
-              job = SolidQueue::Job.instantiate(attrs)
-              execution = SolidQueue::ClaimedExecution.instantiate_claimed(job_id: job.id, process_id: process_id)
-              execution.association(:job).target = job
-              [ ready_id, execution ]
-            end
-
-            values = claimed.map { |_, e| "(#{e.job_id}, #{process_id ? process_id.to_i : "NULL"}, #{now})" }.join(",")
-            client.query("INSERT INTO solid_queue_claimed_executions (job_id, process_id, created_at) VALUES #{values}")
-            client.query("DELETE FROM solid_queue_ready_executions WHERE id IN (#{claimed.map(&:first).join(",")})")
-            client.query("COMMIT")
-
-            claimed.map(&:last)
-          rescue Exception
-            begin client.query("ROLLBACK"); rescue Exception; @claim_mysql_client = nil; end
-            raise
+          rows = result.rows.map do |row|
+            attrs = result.columns.zip(row).to_h
+            ready_id = attrs.delete("ready_id")
+            job = SolidQueue::Job.instantiate(attrs)
+            execution = SolidQueue::ClaimedExecution.instantiate_claimed(job_id: job.id, process_id: process_id)
+            execution.association(:job).target = job
+            [ ready_id, execution ]
           end
-        end.tap do |executions|
+
+          now = Time.current
+          SolidQueue::ClaimedExecution.insert_all!(rows.map { |_, e| { job_id: e.job_id, process_id: process_id, created_at: now } })
+          where(id: rows.map(&:first)).delete_all
+
+          rows.map(&:last)
+        end
+
+        claimed.tap do |executions|
           job_ids = executions.map(&:job_id)
           SolidQueue.instrument(:claim, process_id: process_id, job_ids: job_ids,
             claimed_job_ids: job_ids, size: executions.size)
-        end
-      end
-
-      def claim_mysql_mutex
-        @claim_mysql_mutex ||= Mutex.new
-      end
-
-      # The claimer owns one multi-statement connection for its whole life,
-      # holding the same locks and isolation an Active Record one would
-      def claim_mysql_client
-        @claim_mysql_client ||= begin
-          config = connection_pool.db_config.configuration_hash
-          Mysql2::Client.new(config)
         end
       end
 
