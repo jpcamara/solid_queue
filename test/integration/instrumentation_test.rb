@@ -52,6 +52,38 @@ class InstrumentationTest < ActiveSupport::TestCase
     events.each { |e| assert_event e, "polling" }
   end
 
+  test "finishing jobs in groups emits finish_many_claimed events" do
+    6.times { StoreResultJob.perform_later(42) }
+    jobs = SolidQueue::Job.last(6)
+
+    events = subscribed("finish_many_claimed.solid_queue") do
+      worker = SolidQueue::Worker.new(threads: 3).tap(&:start)
+
+      wait_for_jobs_to_finish_for(3.seconds)
+      worker.stop
+      wait_for_registered_processes(0, timeout: 3.second)
+    end
+
+    assert events.any?
+    events.each { |event| assert_event event, "finish_many_claimed", size: event.last[:job_ids].size }
+    assert events.all? { |event| event.last[:size].between?(1, 3) }
+    assert_equal jobs.map(&:id).sort, events.flat_map { |event| event.last[:job_ids] }.sort
+    assert_equal jobs.map(&:id).sort, events.flat_map { |event| event.last[:finished_job_ids] }.sort
+  end
+
+  test "finishing jobs finalized elsewhere leaves them out of finished_job_ids" do
+    process = SolidQueue::Process.register(kind: "Worker", pid: 42, name: "worker-123")
+    2.times { StoreResultJob.perform_later(42) }
+    SolidQueue::ReadyExecution.claim("*", 2, process.id)
+    claimed = SolidQueue::ClaimedExecution.includes(:job).order(:id).to_a
+    claimed.first.failed_with(RuntimeError.new)
+
+    events = subscribed("finish_many_claimed.solid_queue") { SolidQueue::ClaimedExecution.finish_all(claimed) }
+
+    assert_equal 1, events.size
+    assert_event events.first, "finish_many_claimed", size: 2, job_ids: claimed.map(&:job_id), finished_job_ids: [ claimed.last.job_id ]
+  end
+
   test "stopping a worker with claimed executions emits release_claimed events" do
     StoreResultJob.perform_later(42, pause: SolidQueue.shutdown_timeout + 15.seconds)
     process = nil

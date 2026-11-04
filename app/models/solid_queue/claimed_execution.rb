@@ -5,6 +5,10 @@ class SolidQueue::ClaimedExecution < SolidQueue::Execution
 
   scope :orphaned, -> { where.missing(:process) }
 
+  # Set by a worker to finish successful executions in groups, with its
+  # SolidQueue::Finisher. Without one, each execution finishes on its own.
+  attr_accessor :finisher
+
   class Result < Struct.new(:success, :error)
     def success?
       success
@@ -53,6 +57,27 @@ class SolidQueue::ClaimedExecution < SolidQueue::Execution
       end
     end
 
+    # Finishes successful executions together: one transaction marks all their
+    # jobs as finished and deletes their claims, skipping any execution
+    # whose claim is gone because it has been finalized already.
+    def finish_all(executions)
+      SolidQueue.instrument(:finish_many_claimed, job_ids: executions.map(&:job_id), size: executions.size) do |payload|
+        finished = transaction do
+          lock_all(executions).tap do |claimed|
+            SolidQueue::Job.finish_all(claimed.map(&:job))
+            where(id: claimed.map(&:id)).delete_all
+          end
+        end
+
+        payload[:finished_job_ids] = finished.map(&:job_id)
+
+        # Outside the transaction, as #finalize does for a single job
+        jobs = finished.map(&:job)
+        SolidQueue::Batch.finish_all_with(jobs)
+        jobs.each(&:unblock_next_blocked_job)
+      end
+    end
+
     def discard_all_in_batches(*)
       raise UndiscardableError, "Can't discard jobs in progress"
     end
@@ -60,6 +85,12 @@ class SolidQueue::ClaimedExecution < SolidQueue::Execution
     def discard_all_from_jobs(*)
       raise UndiscardableError, "Can't discard jobs in progress"
     end
+
+    private
+      def lock_all(executions)
+        ids = unscoped.where(id: executions.map(&:id)).order(:id).lock.pluck(:id)
+        executions.select { |execution| ids.include?(execution.id) }
+      end
   end
 
   def perform
@@ -99,7 +130,10 @@ class SolidQueue::ClaimedExecution < SolidQueue::Execution
     end
 
     def finished
-      finalize { job.finished! }
+      if finisher then finisher.finish(self)
+      else
+        finalize { job.finished! }
+      end
     end
 
     def finalize

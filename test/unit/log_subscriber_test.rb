@@ -26,6 +26,13 @@ class LogSubscriberTest < ActiveSupport::TestCase
     assert_match_logged :debug, "Unblock jobs", "limit: 42, size: 10"
   end
 
+  test "finish many claimed jobs" do
+    attach_log_subscriber
+    instrument "finish_many_claimed.solid_queue", job_ids: [ 1, 2 ], finished_job_ids: [ 1 ], size: 2
+
+    assert_match_logged :debug, "Finish claimed jobs", "job_ids: [1, 2], finished_job_ids: [1], size: 2"
+  end
+
   test "recurring task enqueued succesfully" do
     attach_log_subscriber
     time = Time.now
