@@ -29,7 +29,9 @@ module SolidQueue
         return if pending.blank?
 
         SolidQueue::Record.transaction do
-          pending.each { |job, options| job.enqueue_deferred(options) }
+          BatchExecution.counting_jobs do
+            pending.each { |job, options| job.enqueue_deferred(options) }
+          end
         end
       end
 

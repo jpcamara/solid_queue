@@ -73,7 +73,9 @@ module SolidQueue
       transaction do
         save! if new_record?
 
-        self.class.wrap_in_batch_context(id) { block&.call(self) }
+        BatchExecution.counting_jobs do
+          self.class.wrap_in_batch_context(id) { block&.call(self) }
+        end
 
         if ActiveRecord.respond_to?(:after_all_transactions_commit)
           ActiveRecord.after_all_transactions_commit { start }
