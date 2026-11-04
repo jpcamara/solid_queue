@@ -43,7 +43,7 @@ module SolidQueue
         include ActiveJob::ConcurrencyControls
 
         ActiveSupport.on_load :active_record do
-          ActiveJob::Base.include ActiveJob::BatchId
+          ActiveJob::Base.include ActiveJob::BatchId, SolidQueue::DeferredEnqueue
         end
       end
     end
