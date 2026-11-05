@@ -59,10 +59,12 @@ module SolidQueue
           raise enqueue_error
         end
 
-        # A job that's due, without concurrency limits or a batch, only needs
-        # its ready execution. PostgreSQL can insert both in one statement.
+        # A job that's due, without concurrency limits, only needs its ready
+        # execution, and a tracking row if it's in a batch that's already
+        # counted and locked in this transaction (see BatchExecution.counting_jobs).
+        # PostgreSQL can insert them all in one statement.
         def ready_in_one_statement?(attributes)
-          attributes[:concurrency_key].nil? && attributes[:batch_id].nil? &&
+          attributes[:concurrency_key].nil? && (attributes[:batch_id].nil? || BatchExecution.counted?(attributes[:batch_id])) &&
             (attributes[:scheduled_at].nil? || attributes[:scheduled_at] <= Time.current) &&
             connection_pool.with_connection { |connection| connection.adapter_name == "PostgreSQL" }
         end
@@ -71,6 +73,10 @@ module SolidQueue
           now = Time.current
           attributes = attributes.merge(created_at: now, updated_at: now).compact
           binds = attributes.map { |name, value| ActiveRecord::Relation::QueryAttribute.new(name.to_s, value, type_for_attribute(name)) }
+          tracking_row = if attributes[:batch_id]
+            ", tracked AS (INSERT INTO #{BatchExecution.quoted_table_name} (job_id, batch_id, created_at) SELECT id, batch_id, created_at FROM job)"
+          end
+
           connection_pool.with_connection do |connection|
             columns, ready_columns = [ attributes.keys, ReadyExecution.assumable_attributes_from_job ].map do |names|
               names.map { |name| connection.quote_column_name(name) }
@@ -85,10 +91,10 @@ module SolidQueue
               ), ready AS (
                 INSERT INTO #{ReadyExecution.quoted_table_name} (job_id, #{ready_columns.join(", ")}, created_at)
                 SELECT id, #{ready_columns.join(", ")}, created_at FROM job
-              )
+              )#{tracking_row}
               SELECT * FROM job
             SQL
-          end
+          end.tap { BatchExecution.count_added(attributes) if attributes[:batch_id] }
         end
 
         def create_all_from_active_jobs(active_jobs)

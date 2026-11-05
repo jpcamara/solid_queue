@@ -205,6 +205,22 @@ class SolidQueue::BatchTest < ActiveSupport::TestCase
     assert_equal 10, batch.batch_executions.count
   end
 
+  test "after the first, jobs added to a batch are inserted in one statement each on PostgreSQL" do
+    skip unless SolidQueue::Record.connection.adapter_name == "PostgreSQL"
+
+    single_statements = 0
+    subscriber = ActiveSupport::Notifications.subscribe("sql.active_record") do |*, payload|
+      single_statements += 1 if payload[:sql].start_with?("WITH job AS")
+    end
+    batch = SolidQueue::Batch.enqueue { 5.times { |i| NiceJob.perform_later(i) } }
+    ActiveSupport::Notifications.unsubscribe(subscriber)
+
+    assert_equal 4, single_statements
+    assert_equal 5, batch.reload.total_jobs
+    assert_equal 5, batch.batch_executions.count
+    assert_equal 5, SolidQueue::ReadyExecution.where(job_id: batch.jobs.select(:id)).count
+  end
+
   test "jobs added in a savepoint that rolls back aren't counted" do
     batch = SolidQueue::Batch.enqueue do
       NiceJob.perform_later("kept")

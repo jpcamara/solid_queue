@@ -47,6 +47,18 @@ module SolidQueue
         end
       end
 
+      # Whether jobs added to this batch now only need counting: its counter
+      # was already updated, and the batch locked, in this transaction
+      def counted?(batch_id)
+        counting_for?(batch_id)
+      end
+
+      # Counts a job added to a batch that's #counted?, whose tracking row
+      # the caller inserts itself
+      def count_added(job_attributes)
+        pending_counts[job_attributes[:batch_id]] += 1 unless job_attributes[:arguments]["executions"].to_i > 0
+      end
+
       private
         def counting
           ActiveSupport::IsolatedExecutionState[:solid_queue_batch_counts]
