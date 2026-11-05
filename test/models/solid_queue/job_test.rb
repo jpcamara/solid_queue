@@ -64,6 +64,28 @@ class SolidQueue::JobTest < ActiveSupport::TestCase
     assert_equal 8, execution.priority
   end
 
+  test "a due job without limits or batch is enqueued in one statement on PostgreSQL" do
+    skip unless SolidQueue::Record.connection.adapter_name == "PostgreSQL"
+
+    active_job = nil
+    statements = sql_during { active_job = AddToBufferJob.set(priority: 3, queue: "fast").perform_later(1) }
+
+    assert_equal 1, statements.size
+    job = SolidQueue::Job.find(active_job.provider_job_id)
+    assert active_job.successfully_enqueued?
+    assert_equal [ "fast", 3 ], [ job.queue_name, job.priority ]
+    assert_equal [ "fast", 3 ], [ job.ready_execution.queue_name, job.ready_execution.priority ]
+    assert_equal [ 1 ], job.arguments["arguments"]
+  end
+
+  test "enqueueing in one statement clears the query cache" do
+    SolidQueue::Job.cache do
+      assert_equal 0, SolidQueue::ReadyExecution.count
+      AddToBufferJob.perform_later(1)
+      assert_equal 1, SolidQueue::ReadyExecution.count
+    end
+  end
+
   test "enqueue active job to be scheduled in the future" do
     active_job = AddToBufferJob.new(1).set(priority: 8, queue: "test")
 
@@ -330,6 +352,7 @@ class SolidQueue::JobTest < ActiveSupport::TestCase
 
   test "raise EnqueueError when there's an ActiveRecordError" do
     SolidQueue::Job.stubs(:create!).raises(ActiveRecord::Deadlocked)
+    SolidQueue::Job.stubs(:create_ready).raises(ActiveRecord::Deadlocked)
 
     assert_raises SolidQueue::Job::EnqueueError do
       active_job = AddToBufferJob.new(1).set(priority: 8, queue: "test")
@@ -376,6 +399,17 @@ class SolidQueue::JobTest < ActiveSupport::TestCase
   end
 
   private
+    def sql_during
+      statements = []
+      subscriber = ActiveSupport::Notifications.subscribe("sql.active_record") do |*, payload|
+        statements << payload[:sql] unless payload[:name] == "SCHEMA"
+      end
+      yield
+      statements
+    ensure
+      ActiveSupport::Notifications.unsubscribe(subscriber)
+    end
+
     def assert_ready(&block)
       assert_job_counts(ready: 1, &block)
       assert SolidQueue::Job.last.ready?

@@ -89,6 +89,7 @@ class SolidQueue::RecurringTaskTest < ActiveSupport::TestCase
 
   test "error when enqueuing job before recording task" do
     SolidQueue::Job.stubs(:create!).raises(ActiveRecord::Deadlocked)
+    SolidQueue::Job.stubs(:create_ready).raises(ActiveRecord::Deadlocked)
 
     task = recurring_task_with(class_name: "JobWithoutArguments")
     assert_no_difference -> { SolidQueue::Job.count } do
@@ -309,6 +310,7 @@ class SolidQueue::RecurringTaskTest < ActiveSupport::TestCase
 
   test "reports Job::EnqueueError to Rails.error when enqueuing via Solid Queue" do
     SolidQueue::Job.stubs(:create!).raises(ActiveRecord::Deadlocked)
+    SolidQueue::Job.stubs(:create_ready).raises(ActiveRecord::Deadlocked)
     subscriber = ErrorBuffer.new
     at = Time.now
 

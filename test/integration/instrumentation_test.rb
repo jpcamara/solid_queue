@@ -389,6 +389,7 @@ class InstrumentationTest < ActiveSupport::TestCase
   test "an error enqueuing a recurring task in Solid Queue is reflected in the enqueue_recurring_task event" do
     recurring_task = { example_task: { class: "AddToBufferJob", schedule: "every second", args: 42 } }
     SolidQueue::Job.stubs(:create!).raises(ActiveRecord::Deadlocked)
+    SolidQueue::Job.stubs(:create_ready).raises(ActiveRecord::Deadlocked)
 
     scheduler = SolidQueue::Scheduler.new(recurring_tasks: recurring_task)
 
