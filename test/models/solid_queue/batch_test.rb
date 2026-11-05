@@ -192,6 +192,58 @@ class SolidQueue::BatchTest < ActiveSupport::TestCase
     assert_equal 1, SolidQueue::Job.where(class_name: OtherAdapterCallbackJob.name).count
   end
 
+  test "jobs added in one enqueue update the batch counter once, not once per job" do
+    counter_updates = 0
+    subscriber = ActiveSupport::Notifications.subscribe("sql.active_record") do |*, payload|
+      counter_updates += 1 if payload[:sql].match?(/\AUPDATE.*total_jobs/i)
+    end
+    batch = SolidQueue::Batch.enqueue { 10.times { |i| NiceJob.perform_later(i) } }
+    ActiveSupport::Notifications.unsubscribe(subscriber)
+
+    assert_equal 2, counter_updates # the first job's, which checks the batch, and the rest
+    assert_equal 10, batch.reload.total_jobs
+    assert_equal 10, batch.batch_executions.count
+  end
+
+  test "after the first, jobs added to a batch are inserted in one statement each on PostgreSQL" do
+    skip unless SolidQueue::Record.connection.adapter_name == "PostgreSQL"
+
+    single_statements = 0
+    subscriber = ActiveSupport::Notifications.subscribe("sql.active_record") do |*, payload|
+      single_statements += 1 if payload[:sql].start_with?("WITH job AS")
+    end
+    batch = SolidQueue::Batch.enqueue { 5.times { |i| NiceJob.perform_later(i) } }
+    ActiveSupport::Notifications.unsubscribe(subscriber)
+
+    assert_equal 4, single_statements
+    assert_equal 5, batch.reload.total_jobs
+    assert_equal 5, batch.batch_executions.count
+    assert_equal 5, SolidQueue::ReadyExecution.where(job_id: batch.jobs.select(:id)).count
+  end
+
+  test "jobs added in a savepoint that rolls back aren't counted" do
+    batch = SolidQueue::Batch.enqueue do
+      NiceJob.perform_later("kept")
+      SolidQueue::Record.transaction(requires_new: true) do
+        NiceJob.perform_later("rolled back")
+        raise ActiveRecord::Rollback
+      end
+      NiceJob.perform_later("also kept")
+    end
+
+    assert_equal 2, batch.reload.total_jobs
+    assert_equal 2, batch.jobs.count
+  end
+
+  test "jobs added from a savepoint first are counted once it commits" do
+    batch = SolidQueue::Batch.enqueue do
+      SolidQueue::Record.transaction(requires_new: true) { NiceJob.perform_later("in savepoint") }
+      3.times { |i| NiceJob.perform_later(i) }
+    end
+
+    assert_equal 4, batch.reload.total_jobs
+  end
+
   test "assigns a reserved active_job_batch_id on create" do
     batch = SolidQueue::Batch.enqueue { NiceJob.perform_later("world") }
 

@@ -36,6 +36,15 @@ class ForkSupervisorTest < ActiveSupport::TestCase
     File.delete(@startup_log) if File.exist?(@startup_log)
   end
 
+  test "processes are forked without the supervisor's database connections" do
+    worker = SolidQueue::Worker.new(queues: "background", threads: 1)
+    forking = sequence("forking")
+    ActiveRecord::Base.connection_handler.expects(:clear_all_connections!).with(:all).in_sequence(forking)
+    worker.expects(:fork).in_sequence(forking).returns(4242)
+
+    assert_equal 4242, worker.send(:create_fork) { }
+  end
+
   test "start" do
     pid = run_supervisor_as_fork
     wait_for_registered_processes(4)

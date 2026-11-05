@@ -18,6 +18,14 @@ module SolidQueue
         def batch_all(jobs)
           BatchExecution.create_all_from_jobs(jobs) if Batch.migrated?
         end
+
+        # Finished jobs stop counting as pending in their batches. Unlike
+        # #update_batch_progress, this doesn't check the batches for completion:
+        # the caller does, once per batch, after committing.
+        def unbatch_all_finished(jobs)
+          batched_jobs = jobs.select(&:batched?)
+          BatchExecution.where(job_id: batched_jobs.map(&:id)).delete_all if batched_jobs.any?
+        end
       end
 
       # Also guards against the batches schema not being installed: without

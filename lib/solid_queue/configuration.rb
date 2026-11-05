@@ -296,7 +296,8 @@ module SolidQueue
 
       def estimated_database_pool_size_for_worker(options)
         # Connections used to execute jobs + 1 for the worker's polling thread + 1 for the heartbeat task
-        estimated_execution_connections_for_worker(options) + 2
+        # + 1 for the finisher thread
+        estimated_execution_connections_for_worker(options) + 3
       end
 
       def worker_capacity(options)

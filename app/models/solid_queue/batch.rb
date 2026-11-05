@@ -43,6 +43,13 @@ module SolidQueue
         end
       end
 
+      # Checks once per batch whether jobs that finished together completed it
+      def finish_all_with(jobs)
+        batch_ids = jobs.select(&:batched?).map(&:batch_id).uniq
+        # Skip the serialized callback and metadata columns, as BatchExecution#finish_batch does
+        select(:id, :finished_at, :enqueued_at).where(id: batch_ids).each(&:finish) if batch_ids.any?
+      end
+
       def current_batch_id
         ActiveSupport::IsolatedExecutionState[:current_batch_id]
       end
@@ -66,7 +73,9 @@ module SolidQueue
       transaction do
         save! if new_record?
 
-        self.class.wrap_in_batch_context(id) { block&.call(self) }
+        BatchExecution.counting_jobs do
+          self.class.wrap_in_batch_context(id) { block&.call(self) }
+        end
 
         if ActiveRecord.respond_to?(:after_all_transactions_commit)
           ActiveRecord.after_all_transactions_commit { start }

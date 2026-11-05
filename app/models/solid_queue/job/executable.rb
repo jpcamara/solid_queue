@@ -34,6 +34,20 @@ module SolidQueue
           successfully_dispatched(jobs)
         end
 
+        # The set-based #finished!, for jobs finishing together
+        def finish_all(jobs)
+          unbatch_all_finished(jobs)
+
+          job_ids = jobs.map(&:id)
+
+          if SolidQueue.preserve_finished_jobs?
+            now = Time.current
+            where(id: job_ids).update_all(finished_at: now, updated_at: now)
+          else
+            where(id: job_ids).delete_all
+          end
+        end
+
         private
           def dispatch_all_at_once(jobs)
             ReadyExecution.create_all_from_jobs jobs

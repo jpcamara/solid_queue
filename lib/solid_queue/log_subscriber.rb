@@ -11,6 +11,10 @@ class SolidQueue::LogSubscriber < ActiveSupport::LogSubscriber
     debug formatted_event(event, action: "Claim jobs", **event.payload.slice(:process_id, :job_ids, :claimed_job_ids, :size))
   end
 
+  def finish_many_claimed(event)
+    debug formatted_event(event, action: "Finish claimed jobs", **event.payload.slice(:job_ids, :finished_job_ids, :size))
+  end
+
   def release_many_claimed(event)
     info formatted_event(event, action: "Release claimed jobs", **event.payload.slice(:size))
   end

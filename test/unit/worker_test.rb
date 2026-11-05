@@ -68,6 +68,29 @@ class WorkerTest < ActiveSupport::TestCase
     end
   end
 
+  EXECUTION_MODES.each do |mode|
+    test "finish every job performed, once, before stopping in #{mode[:name]} mode" do
+      50.times { |i| AddToBufferJob.perform_later(i) }
+
+      with_worker_execution_support(mode[:options]) do
+        worker = SolidQueue::Worker.new(queues: "background", polling_interval: 0.2, **mode[:options])
+        worker.start
+
+        wait_while_with_timeout(5.seconds) { JobBuffer.size < 50 }
+        worker.stop
+        wait_for_registered_processes(0, timeout: 1.second)
+
+        assert_equal (0...50).to_a, JobBuffer.values.sort
+        assert_equal 50, SolidQueue::Job.finished.count
+        assert_no_claimed_jobs
+        assert_equal 0, SolidQueue::FailedExecution.count
+        assert_equal 0, SolidQueue::ReadyExecution.count
+      ensure
+        worker&.stop
+      end
+    end
+  end
+
   test "defaults thread workers to the configured thread pool size" do
     worker = SolidQueue::Worker.new(queues: "background", polling_interval: 0.2)
 
