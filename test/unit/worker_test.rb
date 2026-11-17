@@ -326,20 +326,35 @@ class WorkerTest < ActiveSupport::TestCase
     assert_equal 3, SolidQueue::ReadyExecution.count
   end
 
-  test "claim up to prefetch jobs ahead of free threads when the queues are deep" do
-    7.times { |i| StoreResultJob.perform_later(i, pause: 2.seconds) }
+  test "claim ahead of free threads once the worker knows it runs jobs fast enough" do
+    claims = Thread::Queue.new
+    subscriber = ActiveSupport::Notifications.subscribe("claim.solid_queue") { |*, payload| claims << payload[:size] }
+    300.times { |i| StoreResultJob.perform_later(i) }
 
-    worker = SolidQueue::Worker.new(queues: "background", threads: 1, prefetch: 4, polling_interval: 0.2)
-    delays = stub_interruptible_sleep(worker)
+    worker = SolidQueue::Worker.new(queues: "background", threads: 1, prefetch: 4, polling_interval: 0.1).tap(&:start)
+    wait_for_jobs_to_finish_for(10.seconds)
 
-    worker.start
-
-    # A full claim for the free thread, then a full claim ahead, then enough is prefetched
-    assert_equal [ 0, 0, 10.minutes ], Timeout.timeout(1.second) { 3.times.map { delays.pop } }
-    assert_claimed_jobs 5
-    assert_equal 2, SolidQueue::ReadyExecution.count
-    assert_equal 1, JobResult.count
+    assert_equal 300, JobResult.where(status: "completed").count
     assert_metadata SolidQueue::Process.first, prefetch: 4
+
+    # Claims for the only thread bring one job; claims ahead bring more
+    sizes = claims.size.times.map { claims.pop }
+    assert_operator sizes.max, :>, 1
+    assert_operator sizes.max, :<=, 5
+  ensure
+    ActiveSupport::Notifications.unsubscribe(subscriber) if subscriber
+    worker&.stop
+  end
+
+  test "don't claim ahead jobs that take longer than half the polling interval" do
+    6.times { |i| StoreResultJob.perform_later(i, pause: 0.3.seconds) }
+
+    worker = SolidQueue::Worker.new(queues: "background", threads: 1, prefetch: 4, polling_interval: 0.2).tap(&:start)
+
+    5.times do
+      sleep 0.2
+      assert_operator skip_active_record_query_cache { SolidQueue::ClaimedExecution.count }, :<=, 1
+    end
   ensure
     worker&.stop
   end
@@ -348,6 +363,7 @@ class WorkerTest < ActiveSupport::TestCase
     2.times { |i| StoreResultJob.perform_later(i, pause: 2.seconds) }
 
     worker = SolidQueue::Worker.new(queues: "background", threads: 3, prefetch: 4, polling_interval: 0.2)
+    worker.stubs(:ahead).returns(4)
     delays = stub_interruptible_sleep(worker)
 
     worker.start
@@ -364,11 +380,52 @@ class WorkerTest < ActiveSupport::TestCase
     worker&.stop
   end
 
+  test "give prefetched jobs back to their queue when they wait longer than the polling interval" do
+    StoreResultJob.perform_later(:in_progress, pause: 1.5.seconds)
+    4.times { StoreResultJob.perform_later(:prefetched) }
+
+    worker = SolidQueue::Worker.new(queues: "background", threads: 1, prefetch: 4, polling_interval: 0.2)
+    worker.stubs(:ahead).returns(4)
+    worker.start
+
+    wait_while_with_timeout!(1.second) { SolidQueue::ClaimedExecution.count < 5 }
+    claimed_at = SolidQueue::Timer.monotonic_time_now
+
+    # Given back while the job in progress keeps the only thread busy, so another worker can run them
+    wait_while_with_timeout!(1.second) { SolidQueue::ClaimedExecution.count > 1 }
+    assert_operator SolidQueue::Timer.monotonic_time_now - claimed_at, :<, 0.6
+    assert_equal 4, SolidQueue::ReadyExecution.count
+    assert_equal [ "in_progress" ], JobResult.pluck(:value)
+
+    wait_for_jobs_to_finish_for(5.seconds)
+    assert_equal 5, JobResult.where(status: "completed").count
+    assert_no_claimed_jobs
+  ensure
+    worker&.stop
+  end
+
+  test "a job with a higher priority starts within about the polling interval while the worker prefetches" do
+    40.times { |i| StoreResultJob.set(priority: 10).perform_later(i, pause: 0.3.seconds) }
+
+    worker = SolidQueue::Worker.new(queues: "background", threads: 2, prefetch: 8, polling_interval: 0.2).tap(&:start)
+    wait_while_with_timeout(2.seconds) { JobResult.count < 4 }
+
+    enqueued_at = Time.current
+    StoreResultJob.set(priority: 0).perform_later(:urgent)
+    wait_while_with_timeout!(2.seconds) { JobResult.where(value: "urgent").none? }
+
+    assert_operator JobResult.find_by(value: "urgent").created_at - enqueued_at, :<, 3 * worker.polling_interval
+  ensure
+    worker&.stop
+  end
+
   test "release prefetched jobs that haven't started when stopping" do
     StoreResultJob.perform_later(:in_progress, pause: 0.5.seconds)
     4.times { StoreResultJob.perform_later(:prefetched) }
 
-    worker = SolidQueue::Worker.new(queues: "background", threads: 1, prefetch: 4, polling_interval: 0.2).tap(&:start)
+    worker = SolidQueue::Worker.new(queues: "background", threads: 1, prefetch: 4, polling_interval: 5)
+    worker.stubs(:ahead).returns(4)
+    worker.start
     wait_while_with_timeout(1.second) { SolidQueue::ClaimedExecution.count < 5 }
     assert_claimed_jobs 5
 
@@ -380,23 +437,26 @@ class WorkerTest < ActiveSupport::TestCase
     assert_equal 4, SolidQueue::ReadyExecution.count
   end
 
-  test "fail prefetched jobs with the ones in progress when the worker is killed" do
+  test "fail the jobs in progress and release the prefetched ones when the worker is killed" do
     in_progress = StoreResultJob.perform_later(:in_progress, pause: 10.seconds)
     prefetched = 4.times.map { StoreResultJob.perform_later(:prefetched) }
 
-    pid = run_supervisor_as_fork(workers: [ { queues: :background, threads: 1, prefetch: 4 } ])
+    SolidQueue::Worker.any_instance.stubs(:ahead).returns(4)
+    pid = run_supervisor_as_fork(workers: [ { queues: :background, threads: 1, prefetch: 4, polling_interval: 2 } ])
     wait_while_with_timeout!(5.seconds) { JobResult.none? || SolidQueue::ClaimedExecution.count < 5 }
 
     worker = find_processes_registered_as("Worker").first
     signal_process(worker.pid, :KILL, wait: 0.5.seconds)
 
-    # The supervisor replaces the killed worker, failing every job it had claimed
-    wait_while_with_timeout!(5.seconds) { SolidQueue::FailedExecution.count < 5 }
+    # The supervisor replaces the killed worker, failing the job it was running and
+    # releasing the ones it hadn't started, which the new worker runs once it polls
+    wait_while_with_timeout!(10.seconds) { JobResult.where(value: "prefetched").count < 4 }
 
     skip_active_record_query_cache do
-      assert_equal [ in_progress, *prefetched ].map(&:job_id).sort, SolidQueue::FailedExecution.joins(:job).pluck(:active_job_id).sort
-      assert_equal [ "SolidQueue::Processes::ProcessExitError" ], SolidQueue::FailedExecution.all.map(&:exception_class).uniq
-      assert_equal [ "in_progress" ], JobResult.pluck(:value)
+      assert_equal [ in_progress.job_id ], SolidQueue::FailedExecution.joins(:job).pluck(:active_job_id)
+      assert_equal [ "SolidQueue::Processes::ProcessExitError" ], SolidQueue::FailedExecution.all.map(&:exception_class)
+      assert_equal prefetched.map(&:job_id).sort, SolidQueue::Job.finished.pluck(:active_job_id).sort
+      assert_equal [ "in_progress", *[ "prefetched" ] * 4 ], JobResult.order(:id).pluck(:value)
     end
   ensure
     terminate_process(pid) if pid && process_exists?(pid)
