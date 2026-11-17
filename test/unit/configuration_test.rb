@@ -62,6 +62,12 @@ class ConfigurationTest < ActiveSupport::TestCase
     assert_processes configuration, :worker, 2
   end
 
+  test "workers prefetch nothing unless configured to" do
+    configuration = SolidQueue::Configuration.new(workers: [ { queues: "background", prefetch: 16 }, { queues: "*" } ], dispatchers: [])
+
+    assert_processes configuration, :worker, 2, prefetch: [ 16, 0 ]
+  end
+
   test "fibers configure workers to execute jobs in fibers" do
     with_execution_isolation(:fiber) do
       configuration = SolidQueue::Configuration.new(
