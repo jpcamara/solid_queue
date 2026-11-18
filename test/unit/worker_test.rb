@@ -419,6 +419,15 @@ class WorkerTest < ActiveSupport::TestCase
     worker&.stop
   end
 
+  test "a prefetched job the pool rejects as it shuts down raises the rejection, not a locking error" do
+    worker = SolidQueue::Worker.new(queues: "background", threads: 1, prefetch: 4, polling_interval: 0.2)
+    worker.pool.stubs(:schedule).raises(Concurrent::RejectedExecutionError)
+    worker.send(:prefetched) << SolidQueue::Worker::Prefetched.new(:execution, 0)
+
+    assert_raises(Concurrent::RejectedExecutionError) { worker.send(:post_prefetched) }
+    assert_equal 1, worker.pool.available_capacity
+  end
+
   test "release prefetched jobs that haven't started when stopping" do
     StoreResultJob.perform_later(:in_progress, pause: 0.5.seconds)
     4.times { StoreResultJob.perform_later(:prefetched) }

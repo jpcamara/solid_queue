@@ -133,6 +133,10 @@ module SolidQueue
       # Runs in the pool when a thread or fiber becomes free: it hands it the next
       # prefetched job, if any, and wakes the worker to claim more when needed
       def post_prefetched_on_idle
+        # A post that the pool rejects because it's shutting down gives back the capacity it took,
+        # which comes back here, on the same thread, from within post_prefetched
+        return if prefetched_mutex.owned?
+
         prefetched_mutex.synchronize { @completed += 1 }
         remaining = post_prefetched unless stopped? || pool.shutdown?
       ensure
