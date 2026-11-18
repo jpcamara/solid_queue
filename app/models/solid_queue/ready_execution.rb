@@ -39,7 +39,23 @@ module SolidQueue
 
           SolidQueue::ClaimedExecution.claiming(executions.map(&:job_id), process_id) do |claimed|
             ids_to_delete = executions.index_by(&:job_id).values_at(*claimed.map(&:job_id)).map(&:id)
-            where(id: ids_to_delete).delete_all
+            delete_by_primary_key(ids_to_delete)
+          end
+        end
+
+        # MySQL can plan `DELETE ... WHERE id IN (...)` as a scan of the whole table when the list
+        # covers much of it, as when a claim takes most of a short queue. Under REPEATABLE READ that
+        # scan locks every row and the gap after the last one, so it waits on the rows that enqueues
+        # are inserting, while the claim's SELECT ... FOR UPDATE SKIP LOCKED, having reached the end
+        # of the queue, holds the gap those enqueues insert into: they deadlock. With the primary key
+        # forced, the claim locks only the rows it deletes, which it has locked already. The hint is
+        # a comment to PostgreSQL and SQLite, as with use_index (Arel doesn't add hints to deletes).
+        def delete_by_primary_key(ids)
+          connection_pool.with_connection do |connection|
+            connection.delete sanitize_sql_array([ <<~SQL.squish, ids ]), "#{name} Delete All"
+              DELETE /*+ INDEX(#{quoted_table_name} PRIMARY) */ FROM #{quoted_table_name}
+              WHERE #{connection.quote_column_name(primary_key)} IN (?)
+            SQL
           end
         end
 
