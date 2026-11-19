@@ -359,6 +359,33 @@ class WorkerTest < ActiveSupport::TestCase
     worker&.stop
   end
 
+  test "claim ahead only when no claim came back short since the worker last measured its pace" do
+    worker = SolidQueue::Worker.new(queues: "background", threads: 2, prefetch: 8, polling_interval: 0.1)
+    worker.pool.stubs(:schedule)
+    worker.stubs(:monotonic_now).returns(100.0)
+
+    measure_pace = -> do
+      worker.instance_variable_set(:@pace_measured_at, 99.75)
+      worker.instance_variable_set(:@completed_when_measured, 0)
+      worker.instance_variable_set(:@completed, 20)
+      worker.send(:measure_pace)
+      worker.send(:ahead)
+    end
+
+    # 20 jobs finished in 0.25 seconds: it can claim ahead the 4 it finishes in half the polling interval
+    assert_equal 4, measure_pace.call
+
+    # A claim for its two free threads brings one job, so the queues are short, and jobs claimed
+    # ahead would wait in this worker while other workers could start them
+    StoreResultJob.perform_later(:only)
+    worker.send(:poll)
+    assert_claimed_jobs 1
+    assert_equal 0, measure_pace.call
+
+    # Until it measures its pace again with no claim coming back short
+    assert_equal 4, measure_pace.call
+  end
+
   test "claim only for free threads when the queues are shallow, even with prefetch" do
     2.times { |i| StoreResultJob.perform_later(i, pause: 2.seconds) }
 

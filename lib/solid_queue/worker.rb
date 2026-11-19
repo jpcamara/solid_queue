@@ -25,6 +25,7 @@ module SolidQueue
       @giving_back = []
       @ahead = 0
       @completed = 0
+      @short_claims = 0
 
       @pool = Pool.build \
         type: execution_pool_type,
@@ -59,7 +60,9 @@ module SolidQueue
 
         claim_executions(limit).then do |executions|
           # Keep claiming ahead while claims come back full, as the queues are deep
-          @claiming_ahead = ahead > 0 && executions.any? && executions.size == limit
+          full = executions.any? && executions.size == limit
+          @claiming_ahead = ahead > 0 && full
+          @short_claims += 1 unless full
 
           add_to_prefetched(executions)
           post_prefetched
@@ -153,7 +156,8 @@ module SolidQueue
 
       # Claim ahead as many jobs as the pool finishes in half the polling interval, up
       # to `prefetch`, so that prefetched jobs don't wait for long. With jobs that take
-      # longer than that, the worker doesn't claim ahead at all.
+      # longer than that, or when a claim came back short meanwhile, the worker doesn't
+      # claim ahead at all.
       def measure_pace
         return if prefetch.zero?
 
@@ -162,9 +166,21 @@ module SolidQueue
         if @pace_measured_at.nil?
           @pace_measured_at, @completed_when_measured = now, completed
         elsif (elapsed = now - @pace_measured_at) >= polling_interval
-          @ahead = ((completed - @completed_when_measured) * polling_interval / 2 / elapsed).floor.clamp(0, prefetch)
-          @pace_measured_at, @completed_when_measured = now, completed
+          @ahead = if queues_deep?
+            ((completed - @completed_when_measured) * polling_interval / 2 / elapsed).floor.clamp(0, prefetch)
+          else
+            0
+          end
+
+          @pace_measured_at, @completed_when_measured, @short_claims = now, completed, 0
         end
+      end
+
+      # Queues that keep a worker's claims full are deep enough for it to claim ahead. Once a
+      # claim comes back short, the queues are kept short by the workers polling them, and jobs
+      # claimed ahead would wait in this worker's memory while other workers could start them.
+      def queues_deep?
+        @short_claims.zero?
       end
 
       # Prefetched jobs that have waited longer than the polling interval go back to
