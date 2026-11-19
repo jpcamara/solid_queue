@@ -440,10 +440,55 @@ class WorkerTest < ActiveSupport::TestCase
     worker.send(:poll)
   end
 
+  test "never start a prefetched job that has waited longer than the polling interval" do
+    worker = SolidQueue::Worker.new(queues: "background", threads: 2, prefetch: 4, polling_interval: 0.2)
+    now = SolidQueue::Timer.monotonic_time_now
+    worker.send(:prefetched).push \
+      SolidQueue::Worker::Prefetched.new(:fresh, now),
+      SolidQueue::Worker::Prefetched.new(:stale, now - 0.3),
+      SolidQueue::Worker::Prefetched.new(:claimed_after_stale, now)
+
+    # As when the worker was stalled after claiming them: the stale job and the ones after it are
+    # left for the poll to give back, as their claims may have been released meanwhile
+    worker.pool.expects(:post).with(:fresh).once
+    worker.pool.expects(:post).with(:stale).never
+    worker.pool.expects(:post).with(:claimed_after_stale).never
+
+    assert_equal 2, worker.send(:post_prefetched)
+    assert_equal [ :stale, :claimed_after_stale ], worker.send(:prefetched).map(&:execution)
+  end
+
+  test "a worker stalled with prefetched jobs gives them back instead of starting them" do
+    3.times { |i| StoreResultJob.perform_later(i) }
+
+    worker = SolidQueue::Worker.new(queues: "background", threads: 1, prefetch: 4, polling_interval: 0.2)
+    worker.stubs(:ahead).returns(4)
+    worker.instance_variable_set(:@claiming_ahead, true)
+    worker.pool.stubs(:idle?).returns(false)
+    worker.send(:poll)
+    assert_equal 3, worker.send(:prefetched).size
+
+    # Resuming after a stall, its free thread doesn't start them
+    worker.stubs(:monotonic_now).returns(SolidQueue::Timer.monotonic_time_now + 0.3)
+    worker.pool.unstub(:idle?)
+    worker.pool.expects(:post).never
+    worker.send(:post_prefetched_on_idle)
+    assert_claimed_jobs 3
+
+    # And its next poll gives them back
+    worker.pool.stubs(:available_capacity).returns(0)
+    worker.send(:poll)
+
+    assert_empty worker.send(:prefetched)
+    assert_equal 3, SolidQueue::ReadyExecution.count
+    assert_no_claimed_jobs
+    assert_empty JobResult.all
+  end
+
   test "a prefetched job the pool rejects as it shuts down raises the rejection, not a locking error" do
     worker = SolidQueue::Worker.new(queues: "background", threads: 1, prefetch: 4, polling_interval: 0.2)
     worker.pool.stubs(:schedule).raises(Concurrent::RejectedExecutionError)
-    worker.send(:prefetched) << SolidQueue::Worker::Prefetched.new(:execution, 0)
+    worker.send(:prefetched) << SolidQueue::Worker::Prefetched.new(:execution, SolidQueue::Timer.monotonic_time_now)
 
     assert_raises(Concurrent::RejectedExecutionError) { worker.send(:post_prefetched) }
     assert_equal 1, worker.pool.available_capacity

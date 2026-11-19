@@ -125,9 +125,15 @@ module SolidQueue
         @last_claimed_id = [ @last_claimed_id, *ids ].compact.max
       end
 
+      # A prefetched job that has waited longer than the polling interval isn't started: the
+      # next poll gives it back, with the ones claimed after it. A worker stalled for as long as
+      # it takes to be pruned has had them released already, and other workers may run them.
       def post_prefetched
         prefetched_mutex.synchronize do
-          pool.post(prefetched.shift.execution) while prefetched.any? && pool.idle?
+          while prefetched.any? && pool.idle? && !waited_too_long?(prefetched.first)
+            pool.post(prefetched.shift.execution)
+          end
+
           prefetched.size
         end
       end
@@ -179,7 +185,11 @@ module SolidQueue
 
       def prefetched_waiting_too_long?
         oldest = prefetched_mutex.synchronize { prefetched.first }
-        oldest.present? && oldest.claimed_at < monotonic_now - polling_interval
+        oldest.present? && waited_too_long?(oldest)
+      end
+
+      def waited_too_long?(prefetched_job)
+        prefetched_job.claimed_at < monotonic_now - polling_interval
       end
 
       def stop_prefetching
