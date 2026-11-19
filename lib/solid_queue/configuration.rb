@@ -22,7 +22,8 @@ module SolidQueue
       queues: "*",
       threads: 3,
       processes: 1,
-      polling_interval: 0.1
+      polling_interval: 0.1,
+      prefetch: 0
     }
 
     DISPATCHER_DEFAULTS = {

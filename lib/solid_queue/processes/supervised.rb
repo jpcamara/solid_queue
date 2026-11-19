@@ -26,6 +26,12 @@ module SolidQueue::Processes
       end
 
       def create_fork(&block)
+        # A forked process inherits its supervisor's open database connections, sharing their
+        # sockets, and lets go of them when it starts. With mysql2, that can close or replace file
+        # descriptors the forked process has opened since, for its own connections or for its
+        # self-pipe, failing them with EBADF or EOFError. Close them first: each process opens its own.
+        ActiveRecord::Base.connection_handler.clear_all_connections!(:all)
+
         fork do
           register_signal_handlers
           block.call

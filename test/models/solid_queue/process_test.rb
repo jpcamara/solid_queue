@@ -33,6 +33,26 @@ class SolidQueue::ProcessTest < ActiveSupport::TestCase
     assert jobs.all?(&:failed?)
   end
 
+  test "prune a worker that prefetches, failing the jobs it could have started and releasing the rest" do
+    process = SolidQueue::Process.register(kind: "Worker", pid: 43, name: "worker-43", metadata: { pool_size: 2, prefetch: 4 })
+    5.times { |i| StoreResultJob.set(queue: :new_queue).perform_later(i) }
+    jobs = SolidQueue::Job.order(:id).last(5)
+
+    SolidQueue::ReadyExecution.claim("*", 5, process.id)
+
+    travel_to 10.minutes.from_now
+
+    assert_difference -> { SolidQueue::FailedExecution.count }, 2 do
+      assert_difference -> { SolidQueue::ReadyExecution.count }, 3 do
+        SolidQueue::Process.prune
+      end
+    end
+
+    assert SolidQueue::ClaimedExecution.none?
+    assert_equal [ true, true, false, false, false ], jobs.map(&:reload).map(&:failed?)
+    assert_equal [ false, false, true, true, true ], jobs.map(&:ready?)
+  end
+
   test "prune processes including their supervisor with expired heartbeats and fail claimed executions" do
     supervisor = SolidQueue::Process.register(kind: "Supervisor(fork)", pid: 42, name: "supervisor-42")
     process = SolidQueue::Process.register(kind: "Worker", pid: 43, name: "worker-43", supervisor_id: supervisor.id)
