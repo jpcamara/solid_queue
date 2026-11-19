@@ -2,6 +2,9 @@ module ProcessesTestHelper
   private
 
   def run_supervisor_as_fork(**options)
+    # As the supervisor does before forking its processes (see Processes::Supervised#create_fork)
+    ActiveRecord::Base.connection_handler.clear_all_connections!(:all)
+
     fork do
       SolidQueue::Supervisor.start(**options.with_defaults(skip_recurring: true))
     end

@@ -30,6 +30,8 @@ Puma::Plugin.create do
 
       if Gem::Version.new(Puma::Const::VERSION) < Gem::Version.new("7")
         launcher.events.on_booted do
+          # Same as Processes::Supervised#create_fork: don't share database connections with the fork
+          ActiveRecord::Base.connection_handler.clear_all_connections!(:all) if defined?(ActiveRecord::Base)
           @solid_queue_pid = fork do
             Thread.new { monitor_puma }
             SolidQueue::Supervisor.start(mode: :fork)
@@ -45,6 +47,8 @@ Puma::Plugin.create do
         launcher.events.on_restart { stop_solid_queue_fork }
       else
         launcher.events.after_booted do
+          # Same as Processes::Supervised#create_fork: don't share database connections with the fork
+          ActiveRecord::Base.connection_handler.clear_all_connections!(:all) if defined?(ActiveRecord::Base)
           @solid_queue_pid = fork do
             Thread.new { monitor_puma }
             start_solid_queue(mode: :fork)
