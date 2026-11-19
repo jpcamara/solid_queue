@@ -2,8 +2,8 @@
 
 require "test_helper"
 
-# Claims and enqueues on separate connections, for the locks a claim takes. Skipped on SQLite,
-# which has no row-level locking.
+# Claims and enqueues on separate connections, for the locks a claim takes, and claims that lose
+# a deadlock. Outside of transactional tests, as a deadlock rolls back the whole transaction.
 class SolidQueue::ReadyExecutionLockingTest < ActiveSupport::TestCase
   self.use_transactional_tests = false
 
@@ -40,6 +40,37 @@ class SolidQueue::ReadyExecutionLockingTest < ActiveSupport::TestCase
   ensure
     commit&.set
     enqueuer&.join
+  end
+
+  test "make a claim again when it loses a deadlock" do
+    3.times { |i| AddToBufferJob.perform_later(i) }
+    candidates = SolidQueue::ReadyExecution.order(:id).select(:id, :job_id).to_a
+
+    SolidQueue::ReadyExecution.expects(:select_candidates).times(3)
+      .raises(ActiveRecord::Deadlocked).then.raises(ActiveRecord::Deadlocked).then.returns(candidates)
+
+    assert_equal 3, SolidQueue::ReadyExecution.claim("*", 5, 42).size
+    assert_equal 3, SolidQueue::ClaimedExecution.count
+    assert SolidQueue::ReadyExecution.none?
+  end
+
+  test "give up on a claim that keeps losing deadlocks" do
+    3.times { |i| AddToBufferJob.perform_later(i) }
+
+    SolidQueue::ReadyExecution.expects(:select_candidates).times(4).raises(ActiveRecord::Deadlocked)
+
+    assert_raises(ActiveRecord::Deadlocked) { SolidQueue::ReadyExecution.claim("*", 5, 42) }
+    assert_equal 3, SolidQueue::ReadyExecution.count
+  end
+
+  test "don't make a claim again within a transaction that lost a deadlock" do
+    3.times { |i| AddToBufferJob.perform_later(i) }
+
+    SolidQueue::ReadyExecution.expects(:select_candidates).once.raises(ActiveRecord::Deadlocked)
+
+    assert_raises(ActiveRecord::Deadlocked) do
+      SolidQueue::Record.transaction { SolidQueue::ReadyExecution.claim("*", 5, 42) }
+    end
   end
 
   private

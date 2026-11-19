@@ -23,10 +23,22 @@ module SolidQueue
         def select_and_lock(queue_relation, process_id, limit)
           return [] if limit <= 0
 
-          transaction do
-            candidates = select_candidates(queue_relation, limit)
-            lock_candidates(candidates, process_id)
+          retrying_deadlocks do
+            transaction do
+              candidates = select_candidates(queue_relation, limit)
+              lock_candidates(candidates, process_id)
+            end
           end
+        end
+
+        # A claim that loses a deadlock, as claims on MySQL can to enqueues or other claims, has
+        # been rolled back whole, so it's made again, a few times at most. Not within a transaction
+        # someone else opened, though, as the deadlock rolled that back too.
+        def retrying_deadlocks(attempts: 3)
+          yield
+        rescue ActiveRecord::Deadlocked
+          raise if (attempts -= 1) < 0 || connection_pool.with_connection(&:transaction_open?)
+          retry
         end
 
         def select_candidates(queue_relation, limit)
