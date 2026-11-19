@@ -419,6 +419,27 @@ class WorkerTest < ActiveSupport::TestCase
     worker&.stop
   end
 
+  test "claim ahead again only once the worker holds less than half of what it claims ahead" do
+    worker = SolidQueue::Worker.new(queues: "background", threads: 1, prefetch: 8, polling_interval: 0.2)
+    worker.stubs(:ahead).returns(8)
+    worker.pool.stubs(:idle?).returns(false)
+    4.times { worker.send(:prefetched) << SolidQueue::Worker::Prefetched.new(:execution, SolidQueue::Timer.monotonic_time_now) }
+
+    # Holding half of it, the worker waits for its threads to use some
+    SolidQueue::ReadyExecution.expects(:claim).never
+    worker.expects(:wake_up).never
+    assert_equal worker.polling_interval, worker.send(:poll)
+    worker.send(:post_prefetched_on_idle)
+
+    # Below half, a free thread wakes the worker, which claims again
+    worker.send(:prefetched).pop
+    worker.expects(:wake_up).once
+    worker.send(:post_prefetched_on_idle)
+
+    SolidQueue::ReadyExecution.expects(:claim).once.returns([])
+    worker.send(:poll)
+  end
+
   test "a prefetched job the pool rejects as it shuts down raises the rejection, not a locking error" do
     worker = SolidQueue::Worker.new(queues: "background", threads: 1, prefetch: 4, polling_interval: 0.2)
     worker.pool.stubs(:schedule).raises(Concurrent::RejectedExecutionError)

@@ -52,7 +52,7 @@ module SolidQueue
         measure_pace
 
         # Keep polling while holding prefetched jobs, to give them back if they wait too long
-        return polling_interval if prefetched_enough?
+        return polling_interval if ahead > 0 && prefetched_enough?
 
         limit = claim_limit
         return (prefetched.any? ? polling_interval : 10.minutes) unless limit.positive?
@@ -89,8 +89,10 @@ module SolidQueue
         @claiming_ahead
       end
 
-      def prefetched_enough?
-        ahead > 0 && prefetched.size > ahead / 2
+      # The worker claims again only once it holds less than half of what it claims ahead,
+      # so that every claim brings more than half of it
+      def prefetched_enough?(held = prefetched.size)
+        held > 0 && held * 2 >= ahead
       end
 
       # Jobs start in the order of their claimed executions' ids, so the claims a worker holds
@@ -140,7 +142,7 @@ module SolidQueue
         prefetched_mutex.synchronize { @completed += 1 }
         remaining = post_prefetched unless stopped? || pool.shutdown?
       ensure
-        wake_up unless remaining && remaining > ahead / 2
+        wake_up unless remaining && prefetched_enough?(remaining)
       end
 
       # Claim ahead as many jobs as the pool finishes in half the polling interval, up
