@@ -14,7 +14,7 @@ module SolidQueue
     end
 
     include Executable, Clearable, Recurrable, Batchable
-    include ReadyOnInsert
+    include ReadyOnInsert if ActiveRecord.version >= Gem::Version.new("8.0")
 
     serialize :arguments, coder: JSON
 

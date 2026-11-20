@@ -10,6 +10,10 @@ class SolidQueue::JobReadyOnInsertTest < ActiveSupport::TestCase
     end
   end
 
+  setup do
+    skip "Needs Active Record 8 or later" if ActiveRecord.version < Gem::Version.new("8.0")
+  end
+
   teardown do
     SolidQueue::Batch.destroy_all
   end
@@ -24,7 +28,7 @@ class SolidQueue::JobReadyOnInsertTest < ActiveSupport::TestCase
     assert_equal [ solid_queue_job.queue_name, solid_queue_job.priority ], solid_queue_job.ready_execution.attributes.values_at("queue_name", "priority")
 
     if postgresql?
-      assert_equal on_its_own, verbs(statements), statements
+      assert_equal [ "WITH" ], verbs(statements), statements
       assert_match(/INSERT INTO "solid_queue_jobs".*INSERT INTO "solid_queue_ready_executions"/, statements.find { |sql| sql.start_with?("WITH") })
     else
       assert_operator statements.size, :>, 1
@@ -126,7 +130,7 @@ class SolidQueue::JobReadyOnInsertTest < ActiveSupport::TestCase
       statements = capturing_statements { AddToBufferJob.perform_later(1) }
 
       assert_equal "rerouted", SolidQueue::Job.last.ready_execution.queue_name
-      assert_equal on_its_own, verbs(statements), statements if postgresql?
+      assert_equal [ "WITH" ], verbs(statements), statements if postgresql?
     end
   end
 
@@ -148,7 +152,7 @@ class SolidQueue::JobReadyOnInsertTest < ActiveSupport::TestCase
       statements = capturing_statements { job = AddToBufferJob.perform_later(1) }
 
       assert_equal [ [ job.provider_job_id, true, true ] ], committed
-      assert_equal on_its_own, verbs(statements) - [ "SELECT" ], statements if postgresql?
+      assert_equal [ "WITH" ], verbs(statements) - [ "SELECT" ], statements if postgresql?
     end
   end
 
@@ -197,11 +201,6 @@ class SolidQueue::JobReadyOnInsertTest < ActiveSupport::TestCase
   private
     def postgresql?
       SolidQueue::Record.connection.adapter_name == "PostgreSQL"
-    end
-
-    # Rails 7.1 begins the save's transaction for any statement with binds
-    def on_its_own
-      ActiveRecord.version >= Gem::Version.new("7.2") ? [ "WITH" ] : [ "BEGIN", "WITH", "COMMIT" ]
     end
 
     def verbs(statements)
