@@ -72,7 +72,7 @@ class SolidQueue::JobReadyOnInsertTest < ActiveSupport::TestCase
     assert retry_job.successfully_enqueued?
     assert SolidQueue::Job.find(retry_job.provider_job_id).batch_execution.present?
     assert_equal 1, batch.reload.total_jobs
-    assert_equal on_its_own, verbs(statements), statements if postgresql?
+    assert_equal [ "WITH" ], verbs(statements), statements if postgresql?
   end
 
   test "a job added to a finished batch raises and leaves nothing behind" do
@@ -88,7 +88,7 @@ class SolidQueue::JobReadyOnInsertTest < ActiveSupport::TestCase
     assert_equal 1, SolidQueue::ReadyExecution.count
     assert_equal 1, SolidQueue::BatchExecution.count
     assert_equal 1, batch.reload.total_jobs
-    assert_equal on_its_own.map { |verb| verb == "COMMIT" ? "ROLLBACK" : verb }, verbs(statements), statements if postgresql?
+    assert_equal [ "WITH" ], verbs(statements), statements if postgresql?
 
     assert_raises(SolidQueue::Batch::AlreadyFinished) do
       SolidQueue::Job.transaction { late_job.enqueue }
