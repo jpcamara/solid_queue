@@ -24,6 +24,14 @@ class SolidQueue::JobReadyOnInsertTest < ActiveSupport::TestCase
     end
   end
 
+  setup do
+    skip "Needs Active Record 8 or later" if ActiveRecord.version < Gem::Version.new("8.0")
+
+    # Active Record 8.0 begins the open transaction to load a model's schema,
+    # which the first enqueue in a process would do
+    [ SolidQueue::Semaphore, SolidQueue::BlockedExecution, SolidQueue::Batch, SolidQueue::BatchExecution ].each(&:load_schema)
+  end
+
   teardown do
     SolidQueue::Batch.destroy_all
   end
@@ -38,7 +46,7 @@ class SolidQueue::JobReadyOnInsertTest < ActiveSupport::TestCase
     assert_equal [ solid_queue_job.queue_name, solid_queue_job.priority ], solid_queue_job.ready_execution.attributes.values_at("queue_name", "priority")
 
     if postgresql?
-      assert_equal on_its_own, verbs(statements), statements
+      assert_equal [ "WITH" ], verbs(statements), statements
       assert_match(/INSERT INTO "solid_queue_jobs".*INSERT INTO "solid_queue_ready_executions"/, statements.find { |sql| sql.start_with?("WITH") })
     else
       assert_operator statements.size, :>, 1
@@ -70,7 +78,7 @@ class SolidQueue::JobReadyOnInsertTest < ActiveSupport::TestCase
     assert_equal [ semaphore.id, 2 ], [ solid_queue_job.acquired_semaphore_id, solid_queue_job.acquired_concurrency_limit ]
 
     if postgresql?
-      assert_equal on_its_own, verbs(statements), statements
+      assert_equal [ "WITH" ], verbs(statements), statements
       assert_match(/INSERT INTO "solid_queue_semaphores".*INSERT INTO "solid_queue_jobs".*INSERT INTO "solid_queue_ready_executions".*INSERT INTO "solid_queue_blocked_executions"/,
         statements.find { |sql| sql.start_with?("WITH") })
     end
@@ -79,7 +87,7 @@ class SolidQueue::JobReadyOnInsertTest < ActiveSupport::TestCase
     assert SolidQueue::Job.find(job.provider_job_id).ready?
     assert_equal semaphore.id, SolidQueue::Job.find(job.provider_job_id).acquired_semaphore_id
     assert_equal 0, semaphore.reload.value
-    assert_equal on_its_own, verbs(statements), statements if postgresql?
+    assert_equal [ "WITH" ], verbs(statements), statements if postgresql?
 
     created = SolidQueue::Job.enqueue(LimitedToTwoJob.new("other"))
     assert_not created.changed?
@@ -95,7 +103,7 @@ class SolidQueue::JobReadyOnInsertTest < ActiveSupport::TestCase
     assert second.blocked?
     assert_nil second.acquired_semaphore_id
     assert_in_delta LimitedJob.concurrency_duration.from_now, second.blocked_execution.expires_at, 5.seconds
-    assert_equal on_its_own, verbs(statements), statements if postgresql?
+    assert_equal [ "WITH" ], verbs(statements), statements if postgresql?
 
     first.unblock_next_blocked_job
     assert second.reload.ready?
@@ -139,7 +147,7 @@ class SolidQueue::JobReadyOnInsertTest < ActiveSupport::TestCase
     assert retry_job.successfully_enqueued?
     assert SolidQueue::Job.find(retry_job.provider_job_id).batch_execution.present?
     assert_equal 1, batch.reload.total_jobs
-    assert_equal on_its_own, verbs(statements), statements if postgresql?
+    assert_equal [ "WITH" ], verbs(statements), statements if postgresql?
   end
 
   test "a job added to a finished batch raises and leaves nothing behind" do
@@ -155,7 +163,7 @@ class SolidQueue::JobReadyOnInsertTest < ActiveSupport::TestCase
     assert_equal 1, SolidQueue::ReadyExecution.count
     assert_equal 1, SolidQueue::BatchExecution.count
     assert_equal 1, batch.reload.total_jobs
-    assert_equal on_its_own.map { |verb| verb == "COMMIT" ? "ROLLBACK" : verb }, verbs(statements), statements if postgresql?
+    assert_equal [ "WITH" ], verbs(statements), statements if postgresql?
 
     assert_raises(SolidQueue::Batch::AlreadyFinished) do
       SolidQueue::Job.transaction { late_job.enqueue }
@@ -197,7 +205,7 @@ class SolidQueue::JobReadyOnInsertTest < ActiveSupport::TestCase
       statements = capturing_statements { AddToBufferJob.perform_later(1) }
 
       assert_equal "rerouted", SolidQueue::Job.last.ready_execution.queue_name
-      assert_equal on_its_own, verbs(statements), statements if postgresql?
+      assert_equal [ "WITH" ], verbs(statements), statements if postgresql?
     end
   end
 
@@ -219,7 +227,7 @@ class SolidQueue::JobReadyOnInsertTest < ActiveSupport::TestCase
       statements = capturing_statements { job = AddToBufferJob.perform_later(1) }
 
       assert_equal [ [ job.provider_job_id, true, true ] ], committed
-      assert_equal on_its_own, verbs(statements) - [ "SELECT" ], statements if postgresql?
+      assert_equal [ "WITH" ], verbs(statements) - [ "SELECT" ], statements if postgresql?
     end
   end
 
@@ -268,11 +276,6 @@ class SolidQueue::JobReadyOnInsertTest < ActiveSupport::TestCase
   private
     def postgresql?
       SolidQueue::Record.connection.adapter_name == "PostgreSQL"
-    end
-
-    # Rails 7.1 begins the save's transaction for any statement with binds
-    def on_its_own
-      ActiveRecord.version >= Gem::Version.new("7.2") ? [ "WITH" ] : [ "BEGIN", "WITH", "COMMIT" ]
     end
 
     def verbs(statements)

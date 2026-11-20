@@ -17,19 +17,16 @@ module SolidQueue
     # never begun, sends neither BEGIN nor COMMIT. after_commit callbacks still
     # run when the save ends. Otherwise the statement runs inside the
     # transaction, so what callbacks write goes with it.
+    #
+    # It needs Active Record 8 or later.
     module ReadyOnInsert
       extend ActiveSupport::Concern
 
       class_methods do
-        # The INSERT of a record being created. Its arguments changed in Rails
-        # 7.2, which passes the connection first.
-        def _insert_record(*args)
+        # The INSERT of a record being created
+        def _insert_record(connection, values, returning)
           job = ActiveSupport::IsolatedExecutionState[:solid_queue_job_being_created]
-          return super unless job&.class == self
-
-          connection = args.size > 2 ? args.first : self.connection
-          values, returning = args.last(2)
-          return super unless job.ready_on_insert?(connection)
+          return super unless job&.class == self && job.ready_on_insert?(connection)
 
           returned = insert_ready(job, connection, values, Array(returning))
           raise Batch::AlreadyFinished, "Can't add jobs into an already finished batch" if returned.nil?
@@ -131,9 +128,7 @@ module SolidQueue
 
             sql = "WITH #{ctes.join(", ")} SELECT #{returned.join(", ")} FROM job".squish
 
-            # Rails 7.1 begins the transaction anyway for a statement with binds.
-            on_its_own = ActiveRecord.version >= Gem::Version.new("7.2") &&
-              job.saving_in_own_transaction? && connection.open_transactions == 1 &&
+            on_its_own = job.saving_in_own_transaction? && connection.open_transactions == 1 &&
               !connection.current_transaction.materialized? && job.nothing_written_after_insert?
 
             connection.internal_exec_query(sql, "#{name} Create", binds, materialize_transactions: !on_its_own).rows.first.tap do
