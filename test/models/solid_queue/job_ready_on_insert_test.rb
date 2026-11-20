@@ -31,7 +31,7 @@ class SolidQueue::JobReadyOnInsertTest < ActiveSupport::TestCase
     end
   end
 
-  test "scheduled, concurrency limited and batched jobs are inserted and then dispatched" do
+  test "scheduled and concurrency limited jobs are inserted and then dispatched" do
     statements = capturing_statements { AddToBufferJob.set(wait: 1.minute).perform_later(1) }
     assert SolidQueue::Job.last.scheduled?
     assert_no_ready_on_insert statements
@@ -39,12 +39,57 @@ class SolidQueue::JobReadyOnInsertTest < ActiveSupport::TestCase
     statements = capturing_statements { LimitedJob.perform_later("key") }
     assert SolidQueue::Job.last.ready?
     assert_no_ready_on_insert statements
+  end
 
-    statements = capturing_statements { SolidQueue::Batch.enqueue { AddToBufferJob.perform_later(2) } }
+  test "a job in a batch is counted, tracked and made ready by the same statement" do
+    batch = nil
+    statements = capturing_statements { batch = SolidQueue::Batch.enqueue { AddToBufferJob.perform_later(1) } }
+
     job = SolidQueue::Job.last
     assert job.ready?
-    assert job.batch_execution.present?
-    assert_no_ready_on_insert statements
+    assert_equal batch.id, job.batch_execution.batch_id
+    assert_equal 1, batch.reload.total_jobs
+
+    if postgresql?
+      assert_match(/UPDATE "solid_queue_batches" SET total_jobs.*INSERT INTO "solid_queue_jobs".*INSERT INTO "solid_queue_ready_executions".*INSERT INTO "solid_queue_batch_executions"/,
+        statements.find { |sql| sql.start_with?("WITH") })
+      assert statements.none? { |sql| sql.match?(/\AUPDATE "solid_queue_batches" SET total_jobs|\AINSERT INTO "solid_queue_(ready|batch)_executions"/) }, statements
+    else
+      assert_no_ready_on_insert statements
+    end
+  end
+
+  test "a retry rejoining its batch on its own is one statement and isn't counted again" do
+    batch = SolidQueue::Batch.enqueue { AddToBufferJob.perform_later(1) }
+    retry_job = AddToBufferJob.new(2).tap { |job| job.batch_id, job.executions = batch.id, 1 }
+
+    statements = capturing_statements { retry_job.enqueue }
+
+    assert retry_job.successfully_enqueued?
+    assert SolidQueue::Job.find(retry_job.provider_job_id).batch_execution.present?
+    assert_equal 1, batch.reload.total_jobs
+    assert_equal on_its_own, verbs(statements), statements if postgresql?
+  end
+
+  test "a job added to a finished batch raises and leaves nothing behind" do
+    batch = SolidQueue::Batch.enqueue { AddToBufferJob.perform_later(1) }
+    SolidQueue::Batch.where(id: batch.id).update_all(finished_at: Time.current)
+    late_job = AddToBufferJob.new(2).tap { |job| job.batch_id = batch.id }
+
+    statements = capturing_statements do
+      assert_raises(SolidQueue::Batch::AlreadyFinished) { late_job.enqueue }
+    end
+
+    assert_equal 1, SolidQueue::Job.count
+    assert_equal 1, SolidQueue::ReadyExecution.count
+    assert_equal 1, SolidQueue::BatchExecution.count
+    assert_equal 1, batch.reload.total_jobs
+    assert_equal on_its_own.map { |verb| verb == "COMMIT" ? "ROLLBACK" : verb }, verbs(statements), statements if postgresql?
+
+    assert_raises(SolidQueue::Batch::AlreadyFinished) do
+      SolidQueue::Job.transaction { late_job.enqueue }
+    end
+    assert_equal 1, SolidQueue::Job.count
   end
 
   test "enqueued inside a transaction, the job and its ready execution go with it" do
