@@ -87,20 +87,27 @@ module SolidQueue
             end
 
             on_its_own = job.saving_in_own_transaction? && connection.open_transactions == 1 &&
-              !connection.current_transaction.materialized? && job.nothing_written_after_insert?
+              !connection.current_transaction.materialized? && !connection.current_transaction.isolation_level &&
+              job.nothing_written_after_insert? && running_queries_cancellable?
 
             # As the INSERT it replaces would
             ActiveRecord::Base.clear_query_caches_for_current_thread if connection.pool.dirties_query_cache
 
+            completed = false
             begin
-              connection.internal_exec_query(sql, "#{name} Create", binds, materialize_transactions: !on_its_own).rows.first
-            rescue Exception
-              # Interrupted while it waits on a lock, the statement would still
-              # commit once it gets it. Cancel it, as rolling back the
-              # transaction would.
-              connection.send(:cancel_any_running_query) if on_its_own
-              raise
+              connection.internal_exec_query(sql, "#{name} Create", binds, materialize_transactions: !on_its_own).rows.first.tap { completed = true }
+            ensure
+              # Interrupted, or its thread killed, while it waits on a lock,
+              # the statement would still commit once it gets it. Cancel it,
+              # as rolling back the transaction would.
+              connection.send(:cancel_any_running_query) if on_its_own && !completed
             end
+          end
+
+          # Active Record can't cancel a running query with libpq 18 and pg
+          # before 1.6, so the statement isn't run on its own there.
+          def running_queries_cancellable?
+            !(PG.library_version >= 18_00_00 && Gem::Version.new(PG::VERSION) < Gem::Version.new("1.6.0"))
           end
       end
 
@@ -131,7 +138,8 @@ module SolidQueue
       end
 
       def with_transaction_returning_status
-        # Without a connection, the thread can't have a transaction open
+        # A thread without a connection has no transaction open, except on a
+        # pinned connection, whose transaction insert_ready also checks for
         @saving_in_own_transaction = new_record? && !self.class.connection_pool.active_connection?&.transaction_open?
         super
       ensure

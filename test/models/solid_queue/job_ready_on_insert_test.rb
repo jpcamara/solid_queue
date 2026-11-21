@@ -272,43 +272,59 @@ class SolidQueue::JobReadyOnInsertTest < ActiveSupport::TestCase
     assert_equal [ "WITH" ], verbs(statements), statements if postgresql?
   end
 
-  test "an enqueue interrupted while its statement waits on a lock leaves no job" do
+  test "an enqueue interrupted, or whose thread is killed, while its statement waits on a lock leaves no job" do
     skip unless postgresql?
 
     stop = Class.new(Exception)
-    locked, release = Queue.new, Queue.new
-    locker = Thread.new do
-      SolidQueue::Record.connection_pool.with_connection do |connection|
-        connection.transaction do
-          connection.execute("LOCK TABLE solid_queue_jobs IN SHARE MODE")
-          locked << true
-          release.pop
+    { "interrupted" => ->(thread) { thread.raise(stop) }, "killed" => ->(thread) { thread.kill } }.each do |how, interrupt|
+      begin
+        locked, release = Queue.new, Queue.new
+        locker = Thread.new do
+          SolidQueue::Record.connection_pool.with_connection do |connection|
+            connection.transaction do
+              connection.execute("LOCK TABLE solid_queue_jobs IN SHARE MODE")
+              locked << true
+              release.pop
+            end
+          end
         end
+        locked.pop
+
+        enqueuer = Thread.new do
+          SolidQueue::Record.connection_pool.with_connection do
+            AddToBufferJob.perform_later(1)
+          rescue stop
+            SolidQueue::Job.count # The interrupted connection still works
+          end
+        end
+
+        assert wait_until { backends("wait_event_type = 'Lock'") == 1 }, "#{how}: the enqueue didn't wait on the lock"
+        interrupt.call(enqueuer)
+        assert enqueuer.join(5), "#{how}: the statement went on waiting"
+        assert_equal 0, enqueuer.value if how == "interrupted"
+
+        release << true
+        locker.join
+        assert wait_until { backends("state = 'active' AND query LIKE 'WITH job%'").zero? }
+        assert_equal 0, SolidQueue::Record.uncached { SolidQueue::Job.count }, how
+      ensure
+        release&.push(true)
+        locker&.join
+        enqueuer&.join
       end
     end
-    locked.pop
+  end
 
-    enqueuer = Thread.new do
-      SolidQueue::Record.connection_pool.with_connection do
-        AddToBufferJob.perform_later(1)
-      rescue stop
-        SolidQueue::Job.count # The interrupted connection still works
-      end
+  test "with a transaction isolation level set, the statement runs in a transaction at that level" do
+    skip unless postgresql? && SolidQueue::Record.respond_to?(:with_pool_transaction_isolation_level)
+
+    statements = SolidQueue::Record.with_pool_transaction_isolation_level(:serializable) do
+      capturing_statements { AddToBufferJob.perform_later(1) }
     end
 
-    assert wait_until { backends("wait_event_type = 'Lock'") == 1 }, "the enqueue didn't wait on the lock"
-    enqueuer.raise(stop)
-    assert enqueuer.join(5), "the interrupted statement went on waiting"
-    assert_equal 0, enqueuer.value
-
-    release << true
-    locker.join
-    assert wait_until { backends("state = 'active' AND query LIKE 'WITH job%'").zero? }
-    assert_equal 0, SolidQueue::Record.uncached { SolidQueue::Job.count }
-  ensure
-    release&.push(true)
-    locker&.join
-    enqueuer&.join
+    assert_equal [ "BEGIN", "WITH", "COMMIT" ], verbs(statements), statements
+    assert_match(/SERIALIZABLE/, statements.first)
+    assert SolidQueue::Job.last.ready?
   end
 
   private
