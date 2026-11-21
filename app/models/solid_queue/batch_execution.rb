@@ -24,20 +24,20 @@ module SolidQueue
         end
       end
 
+      # A job that has executed before was already counted when it first joined
+      # the batch: retries keep their active_job_id and batch across re-enqueues.
+      # This might undercount jobs whose retries switch to another batch, but that
+      # should be a rare enough case. The counter is used only for report/info, so
+      # we favour simplicity here
+      def count_new_jobs_among(jobs)
+        jobs.reject { |job| job.arguments["executions"].to_i > 0 }.map(&:active_job_id).uniq.size
+      end
+
       private
         def attempt_to_update_total_jobs(batch_id, jobs)
           new_jobs_count = count_new_jobs_among(jobs)
           updated = SolidQueue::Batch.where(id: batch_id).unfinished.update_all([ "total_jobs = total_jobs + ?", new_jobs_count ])
           updated > 0
-        end
-
-        # A job that has executed before was already counted when it first joined
-        # the batch: retries keep their active_job_id and batch across re-enqueues.
-        # This might undercount jobs whose retries switch to another batch, but that
-        # should be a rare enough case. The counter is used only for report/info, so
-        # we favour simplicity here
-        def count_new_jobs_among(jobs)
-          jobs.reject { |job| job.arguments["executions"].to_i > 0 }.map(&:active_job_id).uniq.size
         end
     end
 
