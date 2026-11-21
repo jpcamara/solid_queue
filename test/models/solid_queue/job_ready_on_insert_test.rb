@@ -333,6 +333,39 @@ class SolidQueue::JobReadyOnInsertTest < ActiveSupport::TestCase
     assert SolidQueue::Job.last.ready?
   end
 
+  test "on a connection the server has closed, the enqueue reconnects and succeeds" do
+    skip unless postgresql?
+
+    SolidQueue::Job.count
+    pid = SolidQueue::Record.connection.select_value("SELECT pg_backend_pid()")
+    elsewhere { SolidQueue::Record.connection.select_value("SELECT pg_terminate_backend(#{pid})") }
+    assert wait_until { elsewhere { SolidQueue::Record.connection.select_value("SELECT count(*) FROM pg_stat_activity WHERE pid = #{pid}") }.zero? }
+
+    job = AddToBufferJob.perform_later(1)
+
+    assert job.successfully_enqueued?
+    assert SolidQueue::Job.find(job.provider_job_id).ready?
+  end
+
+  test "a query cached before the enqueue isn't served after it" do
+    SolidQueue::Record.cache do
+      before = SolidQueue::Job.count
+      AddToBufferJob.perform_later(1)
+
+      assert_equal before + 1, SolidQueue::Job.count
+    end
+  end
+
+  test "with a before_commit callback, the insert runs in a transaction and the callback runs before its commit" do
+    called, elsewhere = [], method(:elsewhere)
+    with_job_callback(:record_before_commit, -> { called << elsewhere.call { SolidQueue::Job.exists?(id) } }, :before_commit) do
+      statements = capturing_statements { AddToBufferJob.perform_later(1) }
+
+      assert_equal [ false ], called
+      assert_equal [ "BEGIN", "WITH", "COMMIT" ], verbs(statements) - [ "SELECT" ], statements if postgresql?
+    end
+  end
+
   private
     def postgresql?
       SolidQueue::Record.connection.adapter_name == "PostgreSQL"
@@ -358,7 +391,7 @@ class SolidQueue::JobReadyOnInsertTest < ActiveSupport::TestCase
       SolidQueue::Job.public_send(macro, name, **options)
       yield
     ensure
-      kind = { before_create: [ :create, :before ], after_create: [ :create, :after ], around_create: [ :create, :around ], after_commit: [ :commit, :after ], validate: [ :validate ] }.fetch(macro)
+      kind = { before_create: [ :create, :before ], after_create: [ :create, :after ], around_create: [ :create, :around ], after_commit: [ :commit, :after ], before_commit: [ :before_commit, :before ], validate: [ :validate ] }.fetch(macro)
       SolidQueue::Job.skip_callback(*kind, name)
       SolidQueue::Job.remove_method(name)
     end
