@@ -55,6 +55,10 @@ module SolidQueue
             inserted = Array.new(binds.size) { |i| "$#{i + 1}" }
             ready_columns = ReadyExecution.assumable_attributes_from_job.map(&quote).join(", ")
             returned = returning.map { |name| "job.#{quote.(name)}" }
+            # Only what's read from the job, so the arguments aren't returned
+            from_job = [ "id", "created_at", *ReadyExecution.assumable_attributes_from_job, *returning ]
+            from_job << "batch_id" if job.batched?
+            from_job << "concurrency_key" if job.concurrency_limited?
             ctes, inserted_if, ready_if = [], nil, nil
 
             # Counted first, as BatchExecution.create_all_from_jobs does, and
@@ -91,8 +95,9 @@ module SolidQueue
               ready_if = "WHERE EXISTS (SELECT 1 FROM semaphore)"
 
               arguments = values.keys.index { |name| name.to_s == "arguments" }
-              lock = "'{#{connection.quote_string(ConcurrencyControls::CONCURRENCY_LOCK_KEY.to_json)}:{\"semaphore_id\":' || (SELECT id FROM semaphore) || ',\"limit\":' || #{limit} || '},'"
-              inserted[arguments] = "COALESCE(#{lock} || substr(#{inserted[arguments]}, 2), #{inserted[arguments]})"
+              # Added last, as record_concurrency_lock adds it
+              lock = "',#{connection.quote_string(ConcurrencyControls::CONCURRENCY_LOCK_KEY.to_json)}:{\"semaphore_id\":' || (SELECT id FROM semaphore) || ',\"limit\":' || #{limit} || '}}'"
+              inserted[arguments] = "COALESCE(left(#{inserted[arguments]}, -1) || #{lock}, #{inserted[arguments]})"
               returned << "(SELECT id FROM semaphore)"
             end
 
@@ -100,7 +105,7 @@ module SolidQueue
               job AS (
                 INSERT INTO #{quoted_table_name} (#{columns.join(", ")})
                 #{inserted_if ? "SELECT #{inserted.join(", ")} WHERE #{inserted_if}" : "VALUES (#{inserted.join(", ")})"}
-                RETURNING *
+                RETURNING #{from_job.map(&:to_s).uniq.map(&quote).join(", ")}
               )
             SQL
             ctes << <<~SQL

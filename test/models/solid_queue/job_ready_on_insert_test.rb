@@ -48,6 +48,7 @@ class SolidQueue::JobReadyOnInsertTest < ActiveSupport::TestCase
     if postgresql?
       assert_equal [ "WITH" ], verbs(statements), statements
       assert_match(/INSERT INTO "solid_queue_jobs".*INSERT INTO "solid_queue_ready_executions"/, statements.find { |sql| sql.start_with?("WITH") })
+      assert_no_match(/RETURNING \*|RETURNING [^)]*"arguments"/, statements.find { |sql| sql.start_with?("WITH") })
     else
       assert_operator statements.size, :>, 1
     end
@@ -110,6 +111,8 @@ class SolidQueue::JobReadyOnInsertTest < ActiveSupport::TestCase
     created = SolidQueue::Job.enqueue(LimitedToTwoJob.new("other"))
     assert_not created.changed?
     assert_equal SolidQueue::Job.find(created.id).arguments, created.arguments
+    stored = SolidQueue::Record.connection.select_value("SELECT arguments FROM solid_queue_jobs WHERE id = #{created.id}")
+    assert_equal SolidQueue::Job.type_for_attribute(:arguments).serialize(created.arguments), stored
   end
 
   test "a limited job without a free slot is inserted blocked, and released when the slot is" do
@@ -144,7 +147,7 @@ class SolidQueue::JobReadyOnInsertTest < ActiveSupport::TestCase
         end
       end
     end
-    signalled.pop
+    assert signalled.pop(timeout: 5), "the slot wasn't released"
 
     adder = Thread.new { SolidQueue::Record.connection_pool.with_connection { LimitedJob.perform_later("key").provider_job_id } }
     assert wait_until { backends("wait_event_type = 'Lock' AND query LIKE 'WITH semaphore%'") == 1 }, "the job didn't wait for the release"
@@ -175,9 +178,15 @@ class SolidQueue::JobReadyOnInsertTest < ActiveSupport::TestCase
   end
 
   test "limited jobs in a batch are counted, tracked, and made ready or blocked by the same statement" do
-    batch = SolidQueue::Batch.enqueue { 2.times { LimitedJob.perform_later("key") } }
+    batch = nil
+    statements = capturing_statements { batch = SolidQueue::Batch.enqueue { 2.times { LimitedJob.perform_later("key") } } }
 
     first, second = SolidQueue::Job.order(:id).to_a
+    if postgresql?
+      enqueues = statements.select { |sql| sql.include?('INSERT INTO "solid_queue_jobs"') }
+      assert_equal 2, enqueues.size, statements
+      assert enqueues.all? { |sql| sql.match?(/\AWITH batch AS .*UPDATE "solid_queue_batches".*INSERT INTO "solid_queue_semaphores"/) }, enqueues
+    end
     assert first.ready?
     assert second.blocked?
     assert_equal [ batch.id ] * 2, [ first, second ].map { |job| job.batch_execution.batch_id }
@@ -365,7 +374,7 @@ class SolidQueue::JobReadyOnInsertTest < ActiveSupport::TestCase
         end
       end
     end
-    locked.pop
+    assert locked.pop(timeout: 5), "the batch wasn't locked"
 
     late_job = AddToBufferJob.new(2).tap { |job| job.batch_id = batch.id }
     adder = Thread.new do
@@ -454,7 +463,7 @@ class SolidQueue::JobReadyOnInsertTest < ActiveSupport::TestCase
           end
         end
 
-        assert wait_until { backends("wait_event_type = 'Lock'") == 1 }, "#{how}: the enqueue didn't wait on the lock"
+        assert wait_until { backends("wait_event_type = 'Lock' AND query LIKE 'WITH job%'") == 1 }, "#{how}: the enqueue didn't wait on the lock"
         interrupt.call(enqueuer)
         assert enqueuer.join(5), "#{how}: the statement went on waiting"
         assert_equal 0, enqueuer.value if how == "interrupted"
