@@ -43,6 +43,12 @@ module SolidQueue
 
     private
       def finish_batch
+        # Every finishing job asks whether it was the last one, and almost never
+        # is. Asking the cheap question first means the batch row is only read
+        # for the job that actually finishes the batch. #finish asks it again, so
+        # this decides nothing on its own.
+        return if self.class.where(batch_id: batch_id).exists?
+
         # Skip the serialized callback and metadata columns on this hot path
         if batch = Batch.select(:id, :finished_at, :enqueued_at).find_by(id: batch_id)
           batch.finish
