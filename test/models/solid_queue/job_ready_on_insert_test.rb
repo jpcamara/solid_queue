@@ -90,6 +90,7 @@ class SolidQueue::JobReadyOnInsertTest < ActiveSupport::TestCase
     semaphore = SolidQueue::Semaphore.find_by!(key: solid_queue_job.concurrency_key)
     assert solid_queue_job.ready?
     assert_equal 1, semaphore.value
+    assert_in_delta LimitedToTwoJob.concurrency_duration.from_now, semaphore.expires_at, 5.seconds
     assert_equal [ semaphore.id, 2 ], [ solid_queue_job.acquired_semaphore_id, solid_queue_job.acquired_concurrency_limit ]
 
     if postgresql?
@@ -98,10 +99,12 @@ class SolidQueue::JobReadyOnInsertTest < ActiveSupport::TestCase
         statements.find { |sql| sql.start_with?("WITH") })
     end
 
+    semaphore.update_columns(expires_at: 1.hour.ago)
     statements = capturing_statements { job = LimitedToTwoJob.perform_later("key") }
     assert SolidQueue::Job.find(job.provider_job_id).ready?
     assert_equal semaphore.id, SolidQueue::Job.find(job.provider_job_id).acquired_semaphore_id
     assert_equal 0, semaphore.reload.value
+    assert_in_delta LimitedToTwoJob.concurrency_duration.from_now, semaphore.expires_at, 5.seconds
     assert_equal [ "WITH" ], verbs(statements), statements if postgresql?
 
     created = SolidQueue::Job.enqueue(LimitedToTwoJob.new("other"))
@@ -154,6 +157,21 @@ class SolidQueue::JobReadyOnInsertTest < ActiveSupport::TestCase
     release&.push(true)
     releaser&.join
     adder&.join
+  end
+
+  test "limited jobs enqueued at once for a new key take exactly the slots there are" do
+    skip unless postgresql? # Elsewhere they can deadlock creating the semaphore
+
+    threads, start = 8, Queue.new
+    enqueuers = threads.times.map do
+      Thread.new { SolidQueue::Record.connection_pool.with_connection { start.pop; LimitedToTwoJob.perform_later("key").provider_job_id } }
+    end
+    threads.times { start << true }
+    jobs = SolidQueue::Job.find(enqueuers.map(&:value))
+
+    assert_equal 2, jobs.count(&:ready?)
+    assert_equal threads - 2, jobs.count(&:blocked?)
+    assert_equal 0, SolidQueue::Semaphore.sole.value
   end
 
   test "limited jobs in a batch are counted, tracked, and made ready or blocked by the same statement" do
