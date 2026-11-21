@@ -198,6 +198,38 @@ class SolidQueue::JobReadyOnInsertTest < ActiveSupport::TestCase
     end
   end
 
+  test "a job added while its batch finishes is not inserted" do
+    skip unless postgresql?
+
+    batch = SolidQueue::Batch.enqueue { AddToBufferJob.perform_later(1) }
+    locked, finish = Queue.new, Queue.new
+    finisher = Thread.new do
+      SolidQueue::Record.connection_pool.with_connection do
+        SolidQueue::Batch.transaction do
+          SolidQueue::Batch.lock.find(batch.id)
+          locked << true
+          finish.pop
+          SolidQueue::Batch.where(id: batch.id).update_all(finished_at: Time.current)
+        end
+      end
+    end
+    locked.pop
+
+    late_job = AddToBufferJob.new(2).tap { |job| job.batch_id = batch.id }
+    adder = Thread.new do
+      SolidQueue::Record.connection_pool.with_connection { late_job.enqueue }
+    rescue => error
+      error
+    end
+    wait_while { SolidQueue::Record.connection.select_value("SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock'").zero? }
+    finish << true
+    finisher.join
+
+    assert_kind_of SolidQueue::Batch::AlreadyFinished, adder.value
+    assert_equal 1, SolidQueue::Job.count
+    assert_equal 1, batch.reload.total_jobs
+  end
+
   test "while writes are prevented, nothing is inserted" do
     ActiveRecord::Base.while_preventing_writes do
       assert_raises(SolidQueue::Job::EnqueueError) { AddToBufferJob.perform_later(1) }
@@ -255,6 +287,11 @@ class SolidQueue::JobReadyOnInsertTest < ActiveSupport::TestCase
       kind = { before_create: [ :create, :before ], after_create: [ :create, :after ], around_create: [ :create, :around ], after_commit: [ :commit, :after ], validate: [ :validate ] }.fetch(macro)
       SolidQueue::Job.skip_callback(*kind, name)
       SolidQueue::Job.remove_method(name)
+    end
+
+    def wait_while(timeout: 5)
+      deadline = Time.now + timeout
+      sleep 0.01 while yield && Time.now < deadline
     end
 
     def elsewhere(&block)
