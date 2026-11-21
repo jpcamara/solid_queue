@@ -90,10 +90,11 @@ class SolidQueue::JobReadyOnInsertTest < ActiveSupport::TestCase
     assert_equal 1, batch.reload.total_jobs
     assert_equal [ "WITH" ], verbs(statements), statements if postgresql?
 
-    assert_raises(SolidQueue::Batch::AlreadyFinished) do
-      SolidQueue::Job.transaction { late_job.enqueue }
+    SolidQueue::Job.transaction do
+      assert_raises(SolidQueue::Batch::AlreadyFinished) { late_job.enqueue }
+      assert_equal 1, SolidQueue::Job.count # Before anything is rolled back
+      raise ActiveRecord::Rollback
     end
-    assert_equal 1, SolidQueue::Job.count
   end
 
   test "enqueued inside a transaction, the job and its ready execution go with it" do
@@ -228,6 +229,10 @@ class SolidQueue::JobReadyOnInsertTest < ActiveSupport::TestCase
     assert_kind_of SolidQueue::Batch::AlreadyFinished, adder.value
     assert_equal 1, SolidQueue::Job.count
     assert_equal 1, batch.reload.total_jobs
+  ensure
+    finish&.push(true)
+    finisher&.join
+    adder&.join
   end
 
   test "while writes are prevented, nothing is inserted" do
