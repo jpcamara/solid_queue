@@ -53,16 +53,17 @@ module SolidQueue
             on_its_own = job.saving_in_own_transaction? && connection.open_transactions == 1 &&
               !connection.current_transaction.materialized? && job.nothing_written_after_insert?
 
-            connection.internal_exec_query(sql, "#{name} Create", binds, materialize_transactions: !on_its_own).rows.first.tap do
-              connection.clear_query_cache
-            end
+            # As the INSERT it replaces would
+            ActiveRecord::Base.clear_query_caches_for_current_thread if connection.pool.dirties_query_cache
+
+            connection.internal_exec_query(sql, "#{name} Create", binds, materialize_transactions: !on_its_own).rows.first
           end
       end
 
       attr_writer :made_ready_on_insert
 
       def ready_on_insert?(connection)
-        postgresql?(connection) && due? && !concurrency_limited? && !batched?
+        insertable_ready_on?(connection) && due? && !concurrency_limited? && !batched?
       end
 
       # Whether the save in progress opened its own transaction, rather than
@@ -93,24 +94,29 @@ module SolidQueue
       end
 
       def prepare_for_execution
-        if @made_ready_on_insert
-          @made_ready_on_insert = false
-        else
-          super
-        end
+        super unless @made_ready_on_insert
       end
 
       private
+        # Wraps the create callbacks, so the flag set by the insert holds
+        # for the after_create callbacks and is cleared once they've run,
+        # even if the save fails.
         def _create_record(...)
           state = ActiveSupport::IsolatedExecutionState
           outer, state[:solid_queue_job_being_created] = state[:solid_queue_job_being_created], self
           super
         ensure
           state[:solid_queue_job_being_created] = outer
+          @made_ready_on_insert = false
         end
 
-        def postgresql?(connection)
-          defined?(ActiveRecord::ConnectionAdapters::PostgreSQLAdapter) && connection.is_a?(ActiveRecord::ConnectionAdapters::PostgreSQLAdapter)
+        # A PostgreSQL connection that allows writes, since Active Record
+        # takes a statement starting with WITH for a read and wouldn't stop
+        # it, and that uses INSERT ... RETURNING. Its internal_exec_query is
+        # gone on Rails main.
+        def insertable_ready_on?(connection)
+          defined?(ActiveRecord::ConnectionAdapters::PostgreSQLAdapter) && connection.is_a?(ActiveRecord::ConnectionAdapters::PostgreSQLAdapter) &&
+            !connection.preventing_writes? && connection.use_insert_returning? && connection.respond_to?(:internal_exec_query)
         end
     end
   end
