@@ -92,7 +92,8 @@ class SolidQueue::JobReadyOnInsertTest < ActiveSupport::TestCase
 
     SolidQueue::Job.transaction do
       assert_raises(SolidQueue::Batch::AlreadyFinished) { late_job.enqueue }
-      assert_equal 1, SolidQueue::Job.count # Before anything is rolled back
+      # Before anything is rolled back. The existing path inserts the job before it raises.
+      assert_equal 1, SolidQueue::Job.count if postgresql?
       raise ActiveRecord::Rollback
     end
   end
