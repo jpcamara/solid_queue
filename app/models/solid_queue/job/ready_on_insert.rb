@@ -43,8 +43,12 @@ module SolidQueue
             columns = values.keys.map { |name| connection.quote_column_name(name) }
             ready_columns = ReadyExecution.assumable_attributes_from_job.map { |name| connection.quote_column_name(name) }
             returned = returning.map { |name| "job.#{connection.quote_column_name(name)}" }
+            # Only what's read from the job, so the arguments aren't returned
+            from_job = [ "id", "created_at", *ReadyExecution.assumable_attributes_from_job, *returning ]
 
             placeholders = Array.new(binds.size) { |i| "$#{i + 1}" }.join(", ")
+            from_job << "batch_id" if job.batched?
+            job_returning = from_job.map(&:to_s).uniq.map { |name| connection.quote_column_name(name) }.join(", ")
 
             sql = if job.batched?
               binds += [
@@ -62,7 +66,7 @@ module SolidQueue
                 ), job AS (
                   INSERT INTO #{quoted_table_name} (#{columns.join(", ")})
                   SELECT #{placeholders} WHERE EXISTS (SELECT 1 FROM batch)
-                  RETURNING *
+                  RETURNING #{job_returning}
                 ), ready AS (
                   INSERT INTO #{ReadyExecution.quoted_table_name} (job_id, #{ready_columns.join(", ")}, created_at)
                   SELECT id, #{ready_columns.join(", ")}, created_at FROM job
@@ -77,7 +81,7 @@ module SolidQueue
                 WITH job AS (
                   INSERT INTO #{quoted_table_name} (#{columns.join(", ")})
                   VALUES (#{placeholders})
-                  RETURNING *
+                  RETURNING #{job_returning}
                 ), ready AS (
                   INSERT INTO #{ReadyExecution.quoted_table_name} (job_id, #{ready_columns.join(", ")}, created_at)
                   SELECT id, #{ready_columns.join(", ")}, created_at FROM job

@@ -30,6 +30,7 @@ class SolidQueue::JobReadyOnInsertTest < ActiveSupport::TestCase
     if postgresql?
       assert_equal [ "WITH" ], verbs(statements), statements
       assert_match(/INSERT INTO "solid_queue_jobs".*INSERT INTO "solid_queue_ready_executions"/, statements.find { |sql| sql.start_with?("WITH") })
+      assert_no_match(/RETURNING \*|RETURNING [^)]*"arguments"/, statements.find { |sql| sql.start_with?("WITH") })
     else
       assert_operator statements.size, :>, 1
     end
@@ -215,7 +216,7 @@ class SolidQueue::JobReadyOnInsertTest < ActiveSupport::TestCase
         end
       end
     end
-    locked.pop
+    assert locked.pop(timeout: 5), "the batch wasn't locked"
 
     late_job = AddToBufferJob.new(2).tap { |job| job.batch_id = batch.id }
     adder = Thread.new do
@@ -304,7 +305,7 @@ class SolidQueue::JobReadyOnInsertTest < ActiveSupport::TestCase
           end
         end
 
-        assert wait_until { backends("wait_event_type = 'Lock'") == 1 }, "#{how}: the enqueue didn't wait on the lock"
+        assert wait_until { backends("wait_event_type = 'Lock' AND query LIKE 'WITH job%'") == 1 }, "#{how}: the enqueue didn't wait on the lock"
         interrupt.call(enqueuer)
         assert enqueuer.join(5), "#{how}: the statement went on waiting"
         assert_equal 0, enqueuer.value if how == "interrupted"
