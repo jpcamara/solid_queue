@@ -182,6 +182,19 @@ class SolidQueue::JobReadyOnInsertTest < ActiveSupport::TestCase
     assert job.reload.scheduled?
   end
 
+  test "enqueued from a thread without a connection, the job is still inserted in one statement" do
+    statements = Thread.new do
+      pool = SolidQueue::Record.connection_pool
+      assert_nil pool.active_connection?
+      capturing_statements { AddToBufferJob.perform_later(1) }
+    ensure
+      pool.release_connection
+    end.value
+
+    assert SolidQueue::Job.last.ready?
+    assert_equal [ "WITH" ], verbs(statements), statements if postgresql?
+  end
+
   test "an enqueue interrupted while its statement waits on a lock leaves no job" do
     skip unless postgresql?
 

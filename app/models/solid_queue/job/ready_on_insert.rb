@@ -95,8 +95,8 @@ module SolidQueue
       end
 
       def with_transaction_returning_status
-        pool = self.class.connection_pool
-        @saving_in_own_transaction = new_record? && postgresql_adapter?(pool.db_config.adapter_class) && !pool.with_connection(&:transaction_open?)
+        # Without a connection, the thread can't have a transaction open
+        @saving_in_own_transaction = new_record? && !self.class.connection_pool.active_connection?&.transaction_open?
         super
       ensure
         @saving_in_own_transaction = false
@@ -124,12 +124,8 @@ module SolidQueue
         # it, and that uses INSERT ... RETURNING. Its internal_exec_query is
         # gone on Rails main.
         def insertable_ready_on?(connection)
-          postgresql_adapter?(connection.class) && !connection.preventing_writes? &&
-            connection.use_insert_returning? && connection.respond_to?(:internal_exec_query)
-        end
-
-        def postgresql_adapter?(adapter_class)
-          defined?(ActiveRecord::ConnectionAdapters::PostgreSQLAdapter) && adapter_class <= ActiveRecord::ConnectionAdapters::PostgreSQLAdapter
+          defined?(ActiveRecord::ConnectionAdapters::PostgreSQLAdapter) && connection.is_a?(ActiveRecord::ConnectionAdapters::PostgreSQLAdapter) &&
+            !connection.preventing_writes? && connection.use_insert_returning? && connection.respond_to?(:internal_exec_query)
         end
     end
   end
