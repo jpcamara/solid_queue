@@ -182,6 +182,45 @@ class SolidQueue::JobReadyOnInsertTest < ActiveSupport::TestCase
     assert job.reload.scheduled?
   end
 
+  test "an enqueue interrupted while its statement waits on a lock leaves no job" do
+    skip unless postgresql?
+
+    stop = Class.new(Exception)
+    locked, release = Queue.new, Queue.new
+    locker = Thread.new do
+      SolidQueue::Record.connection_pool.with_connection do |connection|
+        connection.transaction do
+          connection.execute("LOCK TABLE solid_queue_jobs IN SHARE MODE")
+          locked << true
+          release.pop
+        end
+      end
+    end
+    locked.pop
+
+    enqueuer = Thread.new do
+      SolidQueue::Record.connection_pool.with_connection do
+        AddToBufferJob.perform_later(1)
+      rescue stop
+        SolidQueue::Job.count # The interrupted connection still works
+      end
+    end
+
+    assert wait_until { backends("wait_event_type = 'Lock'") == 1 }, "the enqueue didn't wait on the lock"
+    enqueuer.raise(stop)
+    assert enqueuer.join(5), "the interrupted statement went on waiting"
+    assert_equal 0, enqueuer.value
+
+    release << true
+    locker.join
+    assert wait_until { backends("state = 'active' AND query LIKE 'WITH job%'").zero? }
+    assert_equal 0, SolidQueue::Record.uncached { SolidQueue::Job.count }
+  ensure
+    release&.push(true)
+    locker&.join
+    enqueuer&.join
+  end
+
   private
     def postgresql?
       SolidQueue::Record.connection.adapter_name == "PostgreSQL"
@@ -199,7 +238,7 @@ class SolidQueue::JobReadyOnInsertTest < ActiveSupport::TestCase
     end
 
     def assert_no_ready_on_insert(statements)
-      assert statements.none? { |sql| sql.start_with?("WITH job AS") }, statements
+      assert statements.none? { |sql| sql.start_with?("WITH") }, statements
     end
 
     def with_job_callback(name, body, macro, **options)
@@ -210,6 +249,16 @@ class SolidQueue::JobReadyOnInsertTest < ActiveSupport::TestCase
       kind = { before_create: [ :create, :before ], after_create: [ :create, :after ], around_create: [ :create, :around ], after_commit: [ :commit, :after ], validate: [ :validate ] }.fetch(macro)
       SolidQueue::Job.skip_callback(*kind, name)
       SolidQueue::Job.remove_method(name)
+    end
+
+    def wait_until(timeout: 5)
+      deadline = Time.now + timeout
+      sleep 0.01 until (met = yield) || Time.now > deadline
+      met
+    end
+
+    def backends(condition)
+      SolidQueue::Record.uncached { SolidQueue::Record.connection.select_value("SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND pid <> pg_backend_pid() AND #{condition}") }
     end
 
     def elsewhere(&block)
