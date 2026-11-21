@@ -62,14 +62,15 @@ class SolidQueue::JobReadyOnInsertTest < ActiveSupport::TestCase
     assert SolidQueue::Job.last.ready?
     assert_no_ready_on_insert statements
 
-    statements = capturing_statements { SolidQueue::Job.create!(queue_name: "default", class_name: "NoSuchJob", arguments: {}, concurrency_key: "key", active_job_id: SecureRandom.uuid) }
+    statements = capturing_statements { SolidQueue::Job.create!(queue_name: "default", class_name: "NoSuchJob", arguments: { "arguments" => [] }, concurrency_key: "key", active_job_id: SecureRandom.uuid) }
     assert SolidQueue::Job.last.ready?
     assert_no_ready_on_insert statements
   end
 
   test "a limited job whose arguments are empty or already record a slot is inserted and then dispatched" do
     lock_key = SolidQueue::Job::ConcurrencyControls::CONCURRENCY_LOCK_KEY
-    [ {}, { "arguments" => [], lock_key => { "semaphore_id" => 0, "limit" => 1 } } ].each_with_index do |arguments, i|
+    recorded = { "semaphore_id" => 0, "limit" => 1 }
+    [ {}, { "arguments" => [], lock_key => recorded }, { "arguments" => [], lock_key.to_sym => recorded } ].each_with_index do |arguments, i|
       statements = capturing_statements do
         SolidQueue::Job.create!(queue_name: "default", class_name: LimitedJob.name, arguments: arguments, concurrency_key: "key#{i}", active_job_id: SecureRandom.uuid)
       end
