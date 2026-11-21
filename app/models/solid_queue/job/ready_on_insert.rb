@@ -141,9 +141,11 @@ module SolidQueue
       attr_writer :made_ready_on_insert
 
       # Not a job with a concurrency limit that discards it on conflict, nor
-      # one whose class doesn't load, which skips its limits.
+      # one whose class doesn't load, which skips its limits, nor one whose
+      # arguments the statement can't add its slot to.
       def ready_on_insert?(connection)
-        insertable_ready_on?(connection) && due? && (!concurrency_limited? || (job_class.present? && !concurrency_on_conflict.discard?))
+        insertable_ready_on?(connection) && due? &&
+          (!concurrency_limited? || (job_class.present? && !concurrency_on_conflict.discard? && slot_recordable_in_arguments?))
       end
 
       # Whether the save in progress opened its own transaction, rather than
@@ -203,6 +205,11 @@ module SolidQueue
             !connection.preventing_writes? && connection.use_insert_returning? && connection.respond_to?(:internal_exec_query)
         end
 
+        # The statement adds the slot's entry ahead of the serialized arguments'
+        # first key, so they need one, and mustn't have the entry already.
+        def slot_recordable_in_arguments?
+          arguments.is_a?(Hash) && arguments.any? && !arguments.key?(ConcurrencyControls::CONCURRENCY_LOCK_KEY)
+        end
     end
   end
 end

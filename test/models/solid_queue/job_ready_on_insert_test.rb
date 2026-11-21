@@ -67,6 +67,20 @@ class SolidQueue::JobReadyOnInsertTest < ActiveSupport::TestCase
     assert_no_ready_on_insert statements
   end
 
+  test "a limited job whose arguments are empty or already record a slot is inserted and then dispatched" do
+    lock_key = SolidQueue::Job::ConcurrencyControls::CONCURRENCY_LOCK_KEY
+    [ {}, { "arguments" => [], lock_key => { "semaphore_id" => 0, "limit" => 1 } } ].each_with_index do |arguments, i|
+      statements = capturing_statements do
+        SolidQueue::Job.create!(queue_name: "default", class_name: LimitedJob.name, arguments: arguments, concurrency_key: "key#{i}", active_job_id: SecureRandom.uuid)
+      end
+
+      job = SolidQueue::Job.last
+      assert job.ready?
+      assert_equal SolidQueue::Semaphore.find_by!(key: "key#{i}").id, job.acquired_semaphore_id
+      assert_no_ready_on_insert statements
+    end
+  end
+
   test "a limited job takes a slot in the statement that inserts it, and records it" do
     job = nil
     statements = capturing_statements { job = LimitedToTwoJob.perform_later("key") }
