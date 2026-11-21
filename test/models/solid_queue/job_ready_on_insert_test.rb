@@ -273,6 +273,67 @@ class SolidQueue::JobReadyOnInsertTest < ActiveSupport::TestCase
     end
   end
 
+  test "a job added while its batch finishes is not inserted" do
+    skip unless postgresql?
+
+    batch = SolidQueue::Batch.enqueue { AddToBufferJob.perform_later(1) }
+    locked, finish = Queue.new, Queue.new
+    finisher = Thread.new do
+      SolidQueue::Record.connection_pool.with_connection do
+        SolidQueue::Batch.transaction do
+          SolidQueue::Batch.lock.find(batch.id)
+          locked << true
+          finish.pop
+          SolidQueue::Batch.where(id: batch.id).update_all(finished_at: Time.current)
+        end
+      end
+    end
+    locked.pop
+
+    late_job = AddToBufferJob.new(2).tap { |job| job.batch_id = batch.id }
+    adder = Thread.new do
+      SolidQueue::Record.connection_pool.with_connection { late_job.enqueue }
+    rescue => error
+      error
+    end
+    wait_while { SolidQueue::Record.connection.select_value("SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock'").zero? }
+    finish << true
+    finisher.join
+
+    assert_kind_of SolidQueue::Batch::AlreadyFinished, adder.value
+    assert_equal 1, SolidQueue::Job.count
+    assert_equal 1, batch.reload.total_jobs
+  end
+
+  test "while writes are prevented, nothing is inserted" do
+    ActiveRecord::Base.while_preventing_writes do
+      assert_raises(SolidQueue::Job::EnqueueError) { AddToBufferJob.perform_later(1) }
+    end
+
+    assert_equal 0, SolidQueue::Job.count
+  end
+
+  test "without INSERT ... RETURNING, the job is inserted and then made ready" do
+    skip unless postgresql?
+
+    ActiveRecord::ConnectionAdapters::PostgreSQLAdapter.any_instance.stubs(:use_insert_returning?).returns(false)
+    statements = capturing_statements { AddToBufferJob.perform_later(1) }
+
+    assert SolidQueue::Job.last.ready?
+    assert_no_ready_on_insert statements
+  end
+
+  test "a save that fails after the insert leaves the next save of the job to dispatch it" do
+    job = SolidQueue::Job.new(queue_name: "default", class_name: "AddToBufferJob", arguments: { "arguments" => [ 1 ] }, active_job_id: SecureRandom.uuid, scheduled_at: Time.current)
+    with_job_callback(:fail_after_insert, proc { |&insert| insert.call; raise ActiveRecord::ActiveRecordError, "failed after insert" }, :around_create) do
+      assert_raises(ActiveRecord::ActiveRecordError) { job.save! }
+    end
+
+    job.scheduled_at = 1.hour.from_now
+    job.save!
+    assert job.reload.scheduled?
+  end
+
   private
     def postgresql?
       SolidQueue::Record.connection.adapter_name == "PostgreSQL"
@@ -298,9 +359,14 @@ class SolidQueue::JobReadyOnInsertTest < ActiveSupport::TestCase
       SolidQueue::Job.public_send(macro, name, **options)
       yield
     ensure
-      kind = { before_create: [ :create, :before ], after_create: [ :create, :after ], after_commit: [ :commit, :after ], validate: [ :validate ] }.fetch(macro)
+      kind = { before_create: [ :create, :before ], after_create: [ :create, :after ], around_create: [ :create, :around ], after_commit: [ :commit, :after ], validate: [ :validate ] }.fetch(macro)
       SolidQueue::Job.skip_callback(*kind, name)
       SolidQueue::Job.remove_method(name)
+    end
+
+    def wait_while(timeout: 5)
+      deadline = Time.now + timeout
+      sleep 0.01 while yield && Time.now < deadline
     end
 
     def elsewhere(&block)
