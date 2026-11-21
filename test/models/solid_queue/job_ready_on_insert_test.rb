@@ -111,7 +111,9 @@ class SolidQueue::JobReadyOnInsertTest < ActiveSupport::TestCase
 
   test "a limited job without a free slot is inserted blocked, and released when the slot is" do
     first, second = LimitedJob.perform_later("key"), nil
+    semaphore = SolidQueue::Semaphore.sole
     statements = capturing_statements { second = LimitedJob.perform_later("key") }
+    assert_equal semaphore.attributes, semaphore.reload.attributes
 
     first, second = SolidQueue::Job.find(first.provider_job_id), SolidQueue::Job.find(second.provider_job_id)
     assert first.ready?
@@ -123,6 +125,46 @@ class SolidQueue::JobReadyOnInsertTest < ActiveSupport::TestCase
     first.unblock_next_blocked_job
     assert second.reload.ready?
     assert_equal SolidQueue::Semaphore.find_by!(key: second.concurrency_key).id, second.acquired_semaphore_id
+  end
+
+  test "a limited job enqueued while its slot is being released waits for it, and takes it" do
+    skip unless postgresql?
+
+    first = SolidQueue::Job.find(LimitedJob.perform_later("key").provider_job_id)
+    signalled, release = Queue.new, Queue.new
+    releaser = Thread.new do
+      SolidQueue::Record.connection_pool.with_connection do
+        SolidQueue::Record.transaction do
+          SolidQueue::Semaphore.signal(first)
+          signalled << true
+          release.pop
+        end
+      end
+    end
+    signalled.pop
+
+    adder = Thread.new { SolidQueue::Record.connection_pool.with_connection { LimitedJob.perform_later("key").provider_job_id } }
+    assert wait_until { backends("wait_event_type = 'Lock' AND query LIKE 'WITH semaphore%'") == 1 }, "the job didn't wait for the release"
+    release << true
+    releaser.join
+
+    assert SolidQueue::Job.find(adder.value).ready?
+    assert_equal 0, SolidQueue::Semaphore.sole.value
+  ensure
+    release&.push(true)
+    releaser&.join
+    adder&.join
+  end
+
+  test "limited jobs in a batch are counted, tracked, and made ready or blocked by the same statement" do
+    batch = SolidQueue::Batch.enqueue { 2.times { LimitedJob.perform_later("key") } }
+
+    first, second = SolidQueue::Job.order(:id).to_a
+    assert first.ready?
+    assert second.blocked?
+    assert_equal [ batch.id ] * 2, [ first, second ].map { |job| job.batch_execution.batch_id }
+    assert_equal 2, batch.reload.total_jobs
+    assert_equal 0, SolidQueue::Semaphore.sole.value
   end
 
   test "a limited job added to a finished batch takes no slot" do
