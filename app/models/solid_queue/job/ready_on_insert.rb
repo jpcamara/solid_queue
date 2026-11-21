@@ -130,7 +130,7 @@ module SolidQueue
 
             on_its_own = job.saving_in_own_transaction? && connection.open_transactions == 1 &&
               !connection.current_transaction.materialized? && !connection.current_transaction.isolation_level &&
-              job.nothing_written_after_insert? && running_queries_cancellable?
+              job.nothing_written_after_insert? && running_queries_cancellable? && nothing_to_read?(connection)
 
             # As the INSERT it replaces would
             ActiveRecord::Base.clear_query_caches_for_current_thread if connection.pool.dirties_query_cache
@@ -144,6 +144,17 @@ module SolidQueue
               # as rolling back the transaction would.
               connection.send(:cancel_any_running_query) if on_its_own && !completed
             end
+          end
+
+          # A connection the server has closed (restarted, failed over, or
+          # terminated the backend) has its closing message waiting to be read.
+          # BEGIN would find that out and reconnect, but the statement on its
+          # own can't be retried safely, so it goes in a transaction instead.
+          def nothing_to_read?(connection)
+            raw = connection.send(:any_raw_connection)
+            !IO.select([ raw.socket_io ], nil, nil, 0)
+          rescue PG::Error, IOError
+            false
           end
 
           # Active Record can't cancel a running query with libpq 18 and pg
