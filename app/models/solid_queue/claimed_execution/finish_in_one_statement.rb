@@ -42,9 +42,11 @@ module SolidQueue
             # As the UPDATE and DELETE it replaces would
             ActiveRecord::Base.clear_query_caches_for_current_thread if connection.pool.dirties_query_cache
 
-            connection.exec_update(<<~SQL.squish, "#{self.class.name} Finish", binds)
+            # Prepared, which Active Record only does for a string when told it can
+            connection.select_all(<<~SQL.squish, "#{self.class.name} Finish", binds, preparable: true).length
               WITH claim AS (DELETE FROM #{self.class.quoted_table_name} WHERE id = $1 RETURNING job_id)
               UPDATE #{jobs} SET #{set.join(", ")} FROM claim WHERE #{jobs}.id = claim.job_id
+              RETURNING #{jobs}.id
             SQL
           end
         end
