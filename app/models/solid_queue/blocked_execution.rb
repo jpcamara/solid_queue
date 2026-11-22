@@ -7,6 +7,8 @@ module SolidQueue
 
     has_one :semaphore, foreign_key: :key, primary_key: :concurrency_key
 
+    prepend ReleaseInOneStatement if ActiveRecord.version >= Gem::Version.new("8.0")
+
     scope :expired, -> { where(expires_at: ...Time.current) }
 
     class << self
