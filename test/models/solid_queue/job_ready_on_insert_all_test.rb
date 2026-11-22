@@ -17,6 +17,27 @@ class SolidQueue::JobReadyOnInsertAllTest < ActiveSupport::TestCase
     end
   end
 
+  class LimitedToTwoForLongerJob < ApplicationJob
+    limits_concurrency key: ->(value, *) { value }, to: 2, duration: 1.hour, group: "limited"
+
+    def perform(value)
+    end
+  end
+
+  class LimitedToOneJob < ApplicationJob
+    limits_concurrency key: ->(value, *) { value }, to: 1, group: "limited"
+
+    def perform(value)
+    end
+  end
+
+  class LimitedToZeroJob < ApplicationJob
+    limits_concurrency key: ->(value, *) { value }, to: 0, group: "limited"
+
+    def perform(value)
+    end
+  end
+
   class DiscardingJob < ApplicationJob
     limits_concurrency key: ->(value) { value }, on_conflict: :discard
 
@@ -99,8 +120,8 @@ class SolidQueue::JobReadyOnInsertAllTest < ActiveSupport::TestCase
     assert_equal 1, SolidQueue::Semaphore.sole.value
   end
 
-  test "a set with a job that discards on conflict, or with different limits on one key, is dispatched one at a time" do
-    [ [ DiscardingJob.new("x"), LimitedToTwoJob.new("a") ], [ LimitedToTwoJob.new("b"), LimitedToThreeJob.new("b") ] ].each do |jobs|
+  test "a set with a job that discards on conflict, or with different limits or durations on one key, is dispatched one at a time" do
+    [ [ DiscardingJob.new("x"), LimitedToTwoJob.new("a") ], [ LimitedToTwoJob.new("b"), LimitedToThreeJob.new("b") ], [ LimitedToTwoJob.new("c"), LimitedToTwoForLongerJob.new("c") ] ].each do |jobs|
       statements = capturing_statements { ActiveJob.perform_all_later(jobs) }
 
       assert find(jobs).all?(&:ready?)
@@ -121,12 +142,101 @@ class SolidQueue::JobReadyOnInsertAllTest < ActiveSupport::TestCase
   test "rolled back, the slots taken are given back" do
     LimitedToTwoJob.perform_later("a")
 
-    SolidQueue::Record.transaction do
-      ActiveJob.perform_all_later([ LimitedToTwoJob.new("a"), LimitedToTwoJob.new("b") ])
-      raise ActiveRecord::Rollback
+    statements = capturing_statements do
+      SolidQueue::Record.transaction do
+        ActiveJob.perform_all_later([ LimitedToTwoJob.new("a"), LimitedToTwoJob.new("b") ])
+        raise ActiveRecord::Rollback
+      end
     end
 
     assert_equal [ [ "limited/a", 1 ] ], SolidQueue::Semaphore.pluck(:key, :value)
+    assert_match(/json_to_recordset/, statements.join("\n")) if postgresql?
+  end
+
+  test "a job that can't be serialized fails the set before any slot is taken" do
+    SolidQueue::Record.transaction do
+      assert_raises(ActiveJob::SerializationError) { ActiveJob.perform_all_later([ LimitedToTwoJob.new("a", Object.new) ]) }
+    end
+
+    assert_empty SolidQueue::Semaphore.all
+    assert_empty SolidQueue::Job.all
+  end
+
+  test "the same job twice, or a limit below 1, is dispatched one at a time" do
+    job = LimitedToOneJob.new("a")
+    zero = LimitedToZeroJob.new("z")
+
+    [ [ job, job ], [ zero, LimitedToZeroJob.new("z") ] ].each do |jobs|
+      statements = capturing_statements { ActiveJob.perform_all_later(jobs) }
+
+      first, second = SolidQueue::Job.where(concurrency_key: jobs.first.concurrency_key).order(:id).to_a
+      assert first.ready?
+      assert second.blocked?
+      assert_no_match(/json_to_recordset/, statements.join("\n"))
+    end
+  end
+
+  test "a perform_all_later from a callback during another keeps its slots apart" do
+    fired = false
+    callback = -> { next if fired; fired = true; ActiveJob.perform_all_later([ AddToBufferJob.new(9) ]) }
+    SolidQueue::Job.set_callback(:find, :after, callback)
+
+    jobs = [ LimitedToTwoJob.new("a") ]
+    begin
+      ActiveJob.perform_all_later(jobs)
+    ensure
+      SolidQueue::Job.skip_callback(:find, :after, callback)
+    end
+
+    assert fired
+    assert find(jobs).first.ready?
+    assert_equal 1, SolidQueue::Semaphore.sole.value
+  end
+
+  test "works when connections can't be checked out permanently" do
+    previous, ActiveRecord.permanent_connection_checkout = ActiveRecord.permanent_connection_checkout, :disallowed
+    jobs = [ LimitedToTwoJob.new("a") ]
+    Thread.new { ActiveJob.perform_all_later(jobs) }.join
+  ensure
+    ActiveRecord.permanent_connection_checkout = previous
+    assert jobs.first.successfully_enqueued?
+    assert find(jobs).first.ready?
+  end
+
+  test "a set takes its batch's lock before its slots, as a single job does, so the two can't deadlock" do
+    skip unless postgresql?
+
+    batch = SolidQueue::Batch.enqueue { AddToBufferJob.perform_later(1) }
+    batch_locked, results = Queue.new, Queue.new
+
+    single = Thread.new do
+      SolidQueue::Record.connection_pool.with_connection do
+        SolidQueue::Record.transaction do
+          SolidQueue::Batch.wrap_in_batch_context(batch.id) { AddToBufferJob.perform_later(2) }
+          batch_locked << true
+          wait_for_a_lock_wait
+          SolidQueue::Batch.wrap_in_batch_context(batch.id) { results << LimitedToTwoJob.perform_later("k").successfully_enqueued? }
+        end
+      end
+    rescue => error
+      results << error
+    end
+
+    set = Thread.new do
+      SolidQueue::Record.connection_pool.with_connection do
+        batch_locked.pop(timeout: 5)
+        jobs = [ LimitedToTwoJob.new("k") ]
+        SolidQueue::Batch.wrap_in_batch_context(batch.id) { ActiveJob.perform_all_later(jobs) }
+        results << jobs.first.successfully_enqueued?
+      end
+    rescue => error
+      results << error
+    end
+
+    [ single, set ].each { |thread| thread.join(10) }
+    assert_equal [ true, true ], 2.times.map { results.pop(timeout: 1) }
+    assert_equal 4, batch.reload.total_jobs
+    assert_equal 2, SolidQueue::Job.where(concurrency_key: "limited/k").count(&:ready?)
   end
 
   test "sets enqueued at the same time on the same keys hand out exactly the slots there are, without deadlocking" do
@@ -149,6 +259,7 @@ class SolidQueue::JobReadyOnInsertAllTest < ActiveSupport::TestCase
           end
         end
       end
+      wait_for_threads_waiting_on(start, threads)
       threads.times { start << true }
       assert_equal [ keys.size * 2 ] * threads, enqueuers.map(&:value), semaphores
 
@@ -162,6 +273,20 @@ class SolidQueue::JobReadyOnInsertAllTest < ActiveSupport::TestCase
   private
     def postgresql?
       SolidQueue::Record.connection.adapter_name == "PostgreSQL"
+    end
+
+    def wait_for_a_lock_wait
+      SolidQueue::Record.connection_pool.with_connection do |connection|
+        50.times do
+          break if connection.select_value("SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock'").to_i > 0
+          sleep 0.1
+        end
+      end
+    end
+
+    def wait_for_threads_waiting_on(queue, count)
+      50.times { queue.num_waiting >= count ? break : sleep(0.1) }
+      assert_equal count, queue.num_waiting
     end
 
     def find(active_jobs)
