@@ -11,7 +11,7 @@ module SolidQueue
     end
 
     include Callbacks, Status
-    include Clearable, Sweepable
+    include Clearable, Sweepable, Rollbackable
 
     has_many :jobs
     has_many :batch_executions, dependent: :destroy
@@ -72,6 +72,10 @@ module SolidQueue
           ActiveRecord.after_all_transactions_commit { start }
         end
       end
+
+      discard_if_enclosing_transactions_roll_back
+
+      self
     end
 
     def metadata
