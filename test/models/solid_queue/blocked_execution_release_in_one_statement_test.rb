@@ -184,6 +184,24 @@ class SolidQueue::BlockedExecutionReleaseInOneStatementTest < ActiveSupport::Tes
     assert statements.any? { |sql| sql.start_with?("WITH semaphore") }, statements if postgresql?
   end
 
+  test "the statement is prepared" do
+    skip "Needs prepared statements" unless postgresql? && SolidQueue::Record.connection.prepared_statements
+
+    SolidQueue::Record.connection_pool.with_connection do |connection|
+      prepared = -> { connection.select_value("SELECT count(*) FROM pg_prepared_statements WHERE statement LIKE 'WITH semaphore AS%'") }
+      first, second = blocked_job("first"), blocked_job("second")
+      signal(first)
+      signal(second)
+
+      assert first.release
+      before = prepared.()
+      assert second.release
+
+      assert_operator before, :>=, 1
+      assert_equal before, prepared.()
+    end
+  end
+
   private
     # Two jobs fill the slots of the key; the third is blocked
     def blocked_job(key = "key")

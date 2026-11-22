@@ -169,6 +169,23 @@ class SolidQueue::ClaimedExecutionFinishInOneStatementTest < ActiveSupport::Test
     end
   end
 
+  test "the statement is prepared" do
+    skip "Needs prepared statements" unless postgresql? && SolidQueue::Record.connection.prepared_statements
+
+    SolidQueue::Record.connection_pool.with_connection do |connection|
+      prepared = -> { connection.select_value("SELECT count(*) FROM pg_prepared_statements WHERE statement LIKE 'WITH claim AS%'") }
+      2.times { AddToBufferJob.perform_later(1) }
+      claimed = SolidQueue::ReadyExecution.claim("background", 2, 42)
+
+      claimed.first.perform
+      before = prepared.()
+      claimed.second.perform
+
+      assert_operator before, :>=, 1
+      assert_equal before, prepared.()
+    end
+  end
+
   private
     def claim(active_job)
       claim_job(SolidQueue::Job.find_by!(active_job_id: active_job.job_id))
