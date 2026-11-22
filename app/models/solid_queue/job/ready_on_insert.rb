@@ -135,37 +135,14 @@ module SolidQueue
 
             on_its_own = job.saving_in_own_transaction? && connection.open_transactions == 1 &&
               !connection.current_transaction.materialized? && !connection.current_transaction.isolation_level &&
-              job.nothing_written_after_insert? && running_queries_cancellable? && nothing_to_read?(connection)
+              job.nothing_written_after_insert? && statement_runnable_on_its_own?(connection)
 
             # As the INSERT it replaces would
             ActiveRecord::Base.clear_query_caches_for_current_thread if connection.pool.dirties_query_cache
 
-            completed = false
-            begin
-              connection.internal_exec_query(sql, "#{name} Create", binds, materialize_transactions: !on_its_own).rows.first.tap { completed = true }
-            ensure
-              # Interrupted, or its thread killed, while it waits on a lock,
-              # the statement would still commit once it gets it. Cancel it,
-              # as rolling back the transaction would.
-              connection.send(:cancel_any_running_query) if on_its_own && !completed
+            cancelling_if_interrupted(connection, on_its_own:) do
+              connection.internal_exec_query(sql, "#{name} Create", binds, materialize_transactions: !on_its_own).rows.first
             end
-          end
-
-          # A connection the server has closed (restarted, failed over, or
-          # terminated the backend) has its closing message waiting to be read.
-          # BEGIN would find that out and reconnect, but the statement on its
-          # own can't be retried safely, so it goes in a transaction instead.
-          def nothing_to_read?(connection)
-            raw = connection.send(:any_raw_connection)
-            !IO.select([ raw.socket_io ], nil, nil, 0)
-          rescue PG::Error, IOError
-            false
-          end
-
-          # Active Record can't cancel a running query with libpq 18 and pg
-          # before 1.6, so the statement isn't run on its own there.
-          def running_queries_cancellable?
-            !(PG.library_version >= 18_00_00 && Gem::Version.new(PG::VERSION) < Gem::Version.new("1.6.0"))
           end
       end
 
@@ -229,13 +206,10 @@ module SolidQueue
           super unless @made_ready_on_insert
         end
 
-        # A PostgreSQL connection that allows writes, since Active Record
-        # takes a statement starting with WITH for a read and wouldn't stop
-        # it, and that uses INSERT ... RETURNING. Its internal_exec_query is
-        # gone on Rails main.
+        # A PostgreSQL connection that allows writes and uses INSERT ...
+        # RETURNING. Its internal_exec_query is gone on Rails main.
         def insertable_ready_on?(connection)
-          defined?(ActiveRecord::ConnectionAdapters::PostgreSQLAdapter) && connection.is_a?(ActiveRecord::ConnectionAdapters::PostgreSQLAdapter) &&
-            !connection.preventing_writes? && connection.use_insert_returning? && connection.respond_to?(:internal_exec_query)
+          self.class.statements_writable_on?(connection) && connection.use_insert_returning? && connection.respond_to?(:internal_exec_query)
         end
 
         # The statement adds the slot's entry ahead of the serialized arguments'
