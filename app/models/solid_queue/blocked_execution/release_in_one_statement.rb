@@ -64,7 +64,8 @@ module SolidQueue
             # As the statements it replaces would
             ActiveRecord::Base.clear_query_caches_for_current_thread if connection.pool.dirties_query_cache
 
-            connection.select_value(<<~SQL.squish, "#{self.class.name} Release", binds)
+            # Prepared, which Active Record only does for a string when told it can
+            connection.select_all(<<~SQL.squish, "#{self.class.name} Release", binds, preparable: true).rows.dig(0, 0)
               WITH semaphore AS (
                 INSERT INTO #{semaphores} (key, value, expires_at, created_at, updated_at)
                 VALUES (#{key}, #{limit} - 1, #{expires_at}, #{now}, #{now})
