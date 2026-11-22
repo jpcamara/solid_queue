@@ -92,28 +92,68 @@ class SolidQueue::ClaimedExecutionFinishInOneStatementTest < ActiveSupport::Test
     end
   end
 
-  test "inside a transaction, the statement runs in it" do
+  test "while writes are prevented, the job finishes as before, and fails to" do
     claimed_execution = claim(AddToBufferJob.perform_later(1))
 
     statements = capturing_statements do
-      SolidQueue::Record.transaction do
-        claimed_execution.perform
-        raise ActiveRecord::Rollback
+      assert_raises(SolidQueue::ClaimedExecution::FinalizationError) do
+        SolidQueue::Record.while_preventing_writes { claimed_execution.perform }
       end
+    end
+
+    assert statements.none? { |sql| sql.start_with?("WITH") }, statements
+    assert SolidQueue::ClaimedExecution.exists?(claimed_execution.id)
+    assert_not SolidQueue::Job.find(claimed_execution.job_id).finished?
+  end
+
+  test "inside a transaction, the job finishes as before" do
+    claimed_execution = claim(AddToBufferJob.perform_later(1))
+
+    SolidQueue::Record.transaction do
+      assert_no_one_statement_finish { claimed_execution.perform }
+      raise ActiveRecord::Rollback
     end
 
     assert SolidQueue::ClaimedExecution.exists?(claimed_execution.id)
     assert_not SolidQueue::Job.find(claimed_execution.job_id).finished?
-    assert_equal [ "BEGIN", "WITH", "ROLLBACK" ], verbs(statements), statements if postgresql?
+    assert claimed_execution.job.changed?
+  end
+
+  test "a job with changes to save finishes as before, saving them" do
+    claimed_execution = claim(AddToBufferJob.perform_later(1))
+    claimed_execution.job.arguments["exception_executions"] = { "[RuntimeError]" => 1 }
+
+    assert_no_one_statement_finish { claimed_execution.perform }
+
+    job = SolidQueue::Job.find(claimed_execution.job_id)
+    assert job.finished?
+    assert_equal({ "[RuntimeError]" => 1 }, job.arguments["exception_executions"])
+  end
+
+  test "without automatic timestamps, updated_at is left alone" do
+    claimed_execution = claim(AddToBufferJob.perform_later(1))
+    updated_at = claimed_execution.job.updated_at
+
+    begin
+      SolidQueue::Job.record_timestamps = false
+      statements = capturing_statements { claimed_execution.perform }
+    ensure
+      SolidQueue::Job.record_timestamps = true
+    end
+
+    job = SolidQueue::Job.find(claimed_execution.job_id)
+    assert job.finished?
+    assert_equal updated_at, job.updated_at
+    assert_equal [ "BEGIN", "WITH", "COMMIT" ], verbs(statements), statements if postgresql?
   end
 
   test "a statement that fails leaves the claim, and raises FinalizationError" do
     claimed_execution = claim(AddToBufferJob.perform_later(1))
-    SolidQueue::Record.connection.stubs(:exec_update).raises(ActiveRecord::StatementInvalid.new("transient DB glitch"))
+    skip unless postgresql?
+    claimed_execution.stubs(:delete_claim_and_finish_job).raises(ActiveRecord::StatementInvalid.new("transient DB glitch"))
 
     assert_raises(SolidQueue::ClaimedExecution::FinalizationError) { claimed_execution.perform }
 
-    SolidQueue::Record.connection.unstub(:exec_update)
     assert SolidQueue::ClaimedExecution.exists?(claimed_execution.id)
     assert_not SolidQueue::Job.find(claimed_execution.job_id).finished?
   end
