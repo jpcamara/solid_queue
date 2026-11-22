@@ -44,7 +44,7 @@ module SolidQueue
             ActiveRecord::Base.clear_query_caches_for_current_thread if connection.pool.dirties_query_cache
 
             # The candidates' text is left as is, since it may quote queue names
-            result = connection.select_all("WITH candidates AS (#{candidates}), " + <<~SQL.squish, "#{name} Claim", binds)
+            result = connection.select_all("WITH candidates AS (#{candidates}), " + <<~SQL.squish, "#{name} Claim", binds, preparable: true)
               claimed AS (
                 INSERT INTO #{claims} (job_id, process_id, created_at)
                 SELECT job_id, CAST($1 AS #{ClaimedExecution.columns_hash["process_id"].sql_type}), #{connection.high_precision_current_timestamp} FROM candidates

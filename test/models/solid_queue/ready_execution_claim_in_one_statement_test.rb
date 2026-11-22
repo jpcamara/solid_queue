@@ -31,6 +31,17 @@ class SolidQueue::ReadyExecutionClaimInOneStatementTest < ActiveSupport::TestCas
     end
   end
 
+  test "the statement is prepared, once per queue and limit" do
+    skip "Needs prepared statements" unless postgresql? && SolidQueue::Record.connection.prepared_statements
+
+    SolidQueue::Record.connection_pool.with_connection do |connection|
+      queue = "prepared-#{SecureRandom.hex(4)}"
+      2.times { SolidQueue::ReadyExecution.claim(queue, 1, 42) }
+
+      assert_equal 1, connection.select_value("SELECT count(*) FROM pg_prepared_statements WHERE statement LIKE 'WITH candidates%#{queue}%'")
+    end
+  end
+
   test "a claimed job runs without being loaded again" do
     claimed = SolidQueue::ReadyExecution.claim("backend", 1, 42).first
 
