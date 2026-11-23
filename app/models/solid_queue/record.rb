@@ -18,7 +18,7 @@ module SolidQueue
         end
       end
 
-      # The adapter that runs claims and finishes on this model's database
+      # The adapter that runs Solid Queue's operations on this model's database
       def database_adapter
         connection_pool.with_connection { |connection| DatabaseAdapters.for(connection) }
       end

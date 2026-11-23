@@ -14,6 +14,7 @@ module SolidQueue
     end
 
     include Executable, Clearable, Recurrable, Batchable
+    include ReadyOnInsert
 
     serialize :arguments, coder: JSON
 

@@ -5,6 +5,13 @@ module SolidQueue
     # Runs the code in the models that works on every database. Adapters for
     # particular databases override what they can do in fewer statements.
     class Base
+      # Inserts the row of a job being created with the INSERT Active Record
+      # built for it, given as the block, and returns what that returns. Its
+      # callbacks then make the job ready, blocked or scheduled.
+      def insert_job(job, *)
+        yield
+      end
+
       # Claims up to limit ready executions from queue_relation for the
       # process, skipping those locked elsewhere, and returns the claims.
       def claim(queue_relation, process_id, limit)
