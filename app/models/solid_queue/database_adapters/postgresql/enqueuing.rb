@@ -4,9 +4,11 @@ module SolidQueue
   module DatabaseAdapters
     class Postgresql
       module Enqueuing
-        # Inserts a job that's due, without a concurrency limit and not in a
-        # batch, with its ready execution in one statement, instead of an
-        # INSERT for each. Others are inserted as in Base.
+        # Inserts a job that's due and without a concurrency limit with its
+        # ready execution in one statement, instead of an INSERT for each. A
+        # job in a batch is counted into the batch and tracked by the same
+        # statement, which inserts nothing when the batch has finished. Others
+        # are inserted as in Base.
         #
         # Active Record begins a transaction only when something first runs in
         # it. When the job's save opened its transaction, nothing has run in it
@@ -18,7 +20,11 @@ module SolidQueue
         def insert_job(job, connection, values, returning)
           return super unless insertable_ready?(job, connection)
 
-          insert_ready(job, connection, values, Array(returning)).tap { job.made_ready_on_insert = true }
+          returned = insert_ready(job, connection, values, Array(returning))
+          raise Batch::AlreadyFinished, "Can't add jobs into an already finished batch" if returned.nil?
+
+          job.made_ready_on_insert = true
+          returned
         end
 
         private
@@ -32,17 +38,49 @@ module SolidQueue
             # Only what's read from the job, so the arguments aren't returned
             from_job = [ "id", "created_at", *ReadyExecution.assumable_attributes_from_job, *returning ]
 
-            sql = <<~SQL.squish
-              WITH job AS (
-                INSERT INTO #{Job.quoted_table_name} (#{columns.join(", ")})
-                VALUES (#{Array.new(binds.size) { |i| "$#{i + 1}" }.join(", ")})
-                RETURNING #{from_job.map(&:to_s).uniq.map { |name| connection.quote_column_name(name) }.join(", ")}
-              ), ready AS (
-                INSERT INTO #{ReadyExecution.quoted_table_name} (job_id, #{ready_columns.join(", ")}, created_at)
-                SELECT id, #{ready_columns.join(", ")}, created_at FROM job
-              )
-              SELECT #{returned.join(", ")} FROM job
-            SQL
+            placeholders = Array.new(binds.size) { |i| "$#{i + 1}" }.join(", ")
+            from_job << "batch_id" if job.batched?
+            job_returning = from_job.map(&:to_s).uniq.map { |name| connection.quote_column_name(name) }.join(", ")
+
+            sql = if job.batched?
+              binds += [
+                ActiveRecord::Relation::QueryAttribute.new("total_jobs", BatchExecution.count_new_jobs_among([ job ]), Batch.type_for_attribute(:total_jobs)),
+                ActiveRecord::Relation::QueryAttribute.new("id", job.batch_id, Batch.type_for_attribute(:id))
+              ]
+
+              # Counted first, as BatchExecution.create_all_from_jobs does, and
+              # the job is inserted only if the batch was still unfinished.
+              <<~SQL.squish
+                WITH batch AS (
+                  UPDATE #{Batch.quoted_table_name} SET total_jobs = total_jobs + $#{binds.size - 1}
+                  WHERE id = $#{binds.size} AND finished_at IS NULL
+                  RETURNING id
+                ), job AS (
+                  INSERT INTO #{Job.quoted_table_name} (#{columns.join(", ")})
+                  SELECT #{placeholders} WHERE EXISTS (SELECT 1 FROM batch)
+                  RETURNING #{job_returning}
+                ), ready AS (
+                  INSERT INTO #{ReadyExecution.quoted_table_name} (job_id, #{ready_columns.join(", ")}, created_at)
+                  SELECT id, #{ready_columns.join(", ")}, created_at FROM job
+                ), batch_execution AS (
+                  INSERT INTO #{BatchExecution.quoted_table_name} (job_id, batch_id, created_at)
+                  SELECT id, batch_id, created_at FROM job
+                )
+                SELECT #{returned.join(", ")} FROM job
+              SQL
+            else
+              <<~SQL.squish
+                WITH job AS (
+                  INSERT INTO #{Job.quoted_table_name} (#{columns.join(", ")})
+                  VALUES (#{placeholders})
+                  RETURNING #{job_returning}
+                ), ready AS (
+                  INSERT INTO #{ReadyExecution.quoted_table_name} (job_id, #{ready_columns.join(", ")}, created_at)
+                  SELECT id, #{ready_columns.join(", ")}, created_at FROM job
+                )
+                SELECT #{returned.join(", ")} FROM job
+              SQL
+            end
 
             on_its_own = job.saving_in_own_transaction? && connection.open_transactions == 1 &&
               !connection.current_transaction.materialized? && !connection.current_transaction.isolation_level &&
@@ -68,7 +106,7 @@ module SolidQueue
           # Rails main.
           def insertable_ready?(job, connection)
             !connection.preventing_writes? && connection.use_insert_returning? && connection.respond_to?(:internal_exec_query) &&
-              job.due? && !job.concurrency_limited? && !job.batched?
+              job.due? && !job.concurrency_limited?
           end
 
           # Whether every callback that runs after the insert, inside the save's

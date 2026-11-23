@@ -3,10 +3,10 @@
 module SolidQueue
   class Job
     # The INSERT of a job being created goes through the database adapter,
-    # which may make the job ready in the same statement. It's still
-    # Job.create!: only its INSERT is the adapter's, so validations and
-    # callbacks run as before, and a job the adapter made ready isn't made
-    # ready again after it.
+    # which may make the job ready, and track it in its batch, in the same
+    # statement. It's still Job.create!: only its INSERT is the adapter's, so
+    # validations and callbacks run as before, and a job the adapter made
+    # ready isn't made ready or tracked again after it.
     module ReadyOnInsert
       extend ActiveSupport::Concern
 
@@ -54,6 +54,10 @@ module SolidQueue
         ensure
           state[:solid_queue_job_being_created] = outer
           @made_ready_on_insert = false
+        end
+
+        def create_batch_execution
+          super unless @made_ready_on_insert
         end
     end
   end
