@@ -133,39 +133,16 @@ module SolidQueue
 
             sql = "WITH #{ctes.join(", ")} SELECT #{returned.join(", ")} FROM job".squish
 
-            on_its_own = job.saving_in_own_transaction? && connection.open_transactions == 1 &&
+            eligible = job.saving_in_own_transaction? && connection.open_transactions == 1 &&
               !connection.current_transaction.materialized? && !connection.current_transaction.isolation_level &&
-              job.nothing_written_after_insert? && running_queries_cancellable? && nothing_to_read?(connection)
+              job.nothing_written_after_insert?
 
             # As the INSERT it replaces would
             ActiveRecord::Base.clear_query_caches_for_current_thread if connection.pool.dirties_query_cache
 
-            completed = false
-            begin
-              connection.internal_exec_query(sql, "#{name} Create", binds, materialize_transactions: !on_its_own).rows.first.tap { completed = true }
-            ensure
-              # Interrupted, or its thread killed, while it waits on a lock,
-              # the statement would still commit once it gets it. Cancel it,
-              # as rolling back the transaction would.
-              connection.send(:cancel_any_running_query) if on_its_own && !completed
+            with_statement_autocommit(connection, eligible: eligible) do |autocommit|
+              connection.internal_exec_query(sql, "#{name} Create", binds, materialize_transactions: !autocommit).rows.first
             end
-          end
-
-          # A connection the server has closed (restarted, failed over, or
-          # terminated the backend) has its closing message waiting to be read.
-          # BEGIN would find that out and reconnect, but the statement on its
-          # own can't be retried safely, so it goes in a transaction instead.
-          def nothing_to_read?(connection)
-            raw = connection.send(:any_raw_connection)
-            !IO.select([ raw.socket_io ], nil, nil, 0)
-          rescue PG::Error, IOError
-            false
-          end
-
-          # Active Record can't cancel a running query with libpq 18 and pg
-          # before 1.6, so the statement isn't run on its own there.
-          def running_queries_cancellable?
-            !(PG.library_version >= 18_00_00 && Gem::Version.new(PG::VERSION) < Gem::Version.new("1.6.0"))
           end
       end
 
