@@ -4,6 +4,8 @@ module SolidQueue
   class ClaimedExecution < Execution
     belongs_to :process
 
+    prepend FinishInOneStatement if ActiveRecord.version >= Gem::Version.new("8.0")
+
     scope :orphaned, -> { where.missing(:process) }
 
     class Result < Struct.new(:success, :error)
