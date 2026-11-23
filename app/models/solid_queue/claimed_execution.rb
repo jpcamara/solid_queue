@@ -102,6 +102,17 @@ module SolidQueue
       finalize { job.failed_with(error) }
     end
 
+    # Runs the block and deletes the claim, in a transaction holding the
+    # claim's lock, unless the claim is already gone. Returns whether it was
+    # there.
+    def finalize_claim
+      unless_already_finalized do
+        yield
+        destroy!
+        true
+      end
+    end
+
     private
       # A failure here means the job already ran but we couldn't record the
       # outcome, and the claim is still held by this living worker, where no
@@ -124,15 +135,14 @@ module SolidQueue
       end
 
       def finished
-        finalize { job.finished! }
+        finalized = self.class.database_adapter.finish(self)
+
+        # As in finalize
+        job.unblock_next_blocked_job if finalized
       end
 
-      def finalize
-        finalized = unless_already_finalized do
-          yield
-          destroy!
-          true
-        end
+      def finalize(&block)
+        finalized = finalize_claim(&block)
 
         # Unblock the next job outside the finalize transaction so a failure while
         # releasing the concurrency lock or dispatching the next job can't roll back
