@@ -19,14 +19,20 @@ module SolidQueue
         QueueSelector.new(queue_list, self).scoped_relations.map(&:count).sum
       end
 
+      # The claim that works on every database, in one transaction.
+      # DatabaseAdapters::Base#claim runs it.
+      def claim_in_transaction(queue_relation, process_id, limit)
+        transaction do
+          candidates = select_candidates(queue_relation, limit)
+          lock_candidates(candidates, process_id)
+        end
+      end
+
       private
         def select_and_lock(queue_relation, process_id, limit)
           return [] if limit <= 0
 
-          transaction do
-            candidates = select_candidates(queue_relation, limit)
-            lock_candidates(candidates, process_id)
-          end
+          database_adapter.claim(queue_relation, process_id, limit)
         end
 
         def select_candidates(queue_relation, limit)

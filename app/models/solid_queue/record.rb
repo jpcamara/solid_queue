@@ -18,6 +18,11 @@ module SolidQueue
         end
       end
 
+      # The adapter that runs claims and finishes on this model's database
+      def database_adapter
+        connection_pool.with_connection { |connection| DatabaseAdapters.for(connection) }
+      end
+
       def supports_insert_conflict_target?
         connection_pool.with_connection do |connection|
           connection.supports_insert_conflict_target?
