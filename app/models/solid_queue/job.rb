@@ -16,6 +16,7 @@ module SolidQueue
     include Executable, Clearable, Recurrable, Batchable
     if ActiveRecord.version >= Gem::Version.new("8.0")
       include ReadyOnInsert
+      prepend UnblockInOneStatement
       singleton_class.prepend ReadyOnInsertAll
     end
 
