@@ -3,10 +3,10 @@
 module SolidQueue
   class Job
     # The INSERT of a job being created goes through the database adapter,
-    # which may make the job ready, and track it in its batch, in the same
+    # which may dispatch the job, and track it in its batch, in the same
     # statement. It's still Job.create!: only its INSERT is the adapter's, so
-    # validations and callbacks run as before, and a job the adapter made
-    # ready isn't made ready or tracked again after it.
+    # validations and callbacks run as before, and a job the adapter
+    # dispatched isn't dispatched or tracked again after it.
     module ReadyOnInsert
       extend ActiveSupport::Concern
 
@@ -21,7 +21,7 @@ module SolidQueue
         end
       end
 
-      # Set by an adapter that made the job ready with its INSERT
+      # Set by an adapter that made the job ready, or blocked, with its INSERT
       attr_writer :made_ready_on_insert
 
       # Whether the save in progress opened its own transaction, rather than
