@@ -21,9 +21,19 @@ module SolidQueue
       end
 
       def unblock_next_blocked_job
+        self.class.database_adapter.unblock_next(self)
+      end
+
+      # The unblock that works on every database, a statement at a time.
+      # DatabaseAdapters::Base#unblock_next runs it.
+      def unblock_next_blocked_job_in_steps
         if release_concurrency_lock
           release_next_blocked_job
         end
+      end
+
+      def release_next_blocked_job
+        BlockedExecution.release_one(concurrency_key)
       end
 
       def acquire_concurrency_lock
@@ -89,10 +99,6 @@ module SolidQueue
 
         def concurrency_lock_recorded?
           arguments.key?(CONCURRENCY_LOCK_KEY)
-        end
-
-        def release_next_blocked_job
-          BlockedExecution.release_one(concurrency_key)
         end
 
         def record_concurrency_lock(semaphore_id:, limit: nil)
