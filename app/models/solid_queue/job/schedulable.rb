@@ -38,7 +38,7 @@ module SolidQueue
 
       private
         def schedule
-          ScheduledExecution.create_or_find_by!(job: self)
+          ScheduledExecution.database_adapter.create_execution(ScheduledExecution, self)
         end
 
         def execution
