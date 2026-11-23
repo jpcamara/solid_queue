@@ -6,6 +6,8 @@ module SolidQueue
 
     assumes_attributes_from_job
 
+    singleton_class.prepend ClaimInOneStatement if ActiveRecord.version >= Gem::Version.new("8.0")
+
     class << self
       def claim(queue_list, limit, process_id)
         QueueSelector.new(queue_list, self).scoped_relations.flat_map do |queue_relation|
