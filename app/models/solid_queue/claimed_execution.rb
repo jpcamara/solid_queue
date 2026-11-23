@@ -24,12 +24,15 @@ module SolidQueue
     end
 
     class << self
-      def claiming(job_ids, process_id, &block)
+      # with_jobs loads each claim's job in the query that loads the claims
+      def claiming(job_ids, process_id, with_jobs: false, &block)
         job_data = Array(job_ids).collect { |job_id| { job_id: job_id, process_id: process_id } }
 
         SolidQueue.instrument(:claim, process_id: process_id, job_ids: job_ids) do |payload|
           insert_all!(job_data)
-          where(job_id: job_ids, process_id: process_id).load.tap do |claimed|
+          claims = where(job_id: job_ids, process_id: process_id)
+          claims = claims.eager_load(:job) if with_jobs
+          claims.load.tap do |claimed|
             block.call(claimed)
 
             payload[:size] = claimed.size
@@ -109,6 +112,17 @@ module SolidQueue
       unless_already_finalized do
         yield
         destroy!
+        true
+      end
+    end
+
+    # As finalize_claim, without reading the claim first: deleting it tells
+    # whether it was there, and locks it as the read did.
+    def finalize_claim_by_deleting
+      transaction do
+        next false unless self.class.unscoped.where(id: id).delete_all == 1
+
+        yield
         true
       end
     end

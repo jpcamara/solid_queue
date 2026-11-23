@@ -21,10 +21,11 @@ module SolidQueue
 
       # The claim that works on every database, in one transaction.
       # DatabaseAdapters::Base#claim runs it.
-      def claim_in_transaction(queue_relation, process_id, limit)
+      # with_jobs loads each claim's job with it.
+      def claim_in_transaction(queue_relation, process_id, limit, with_jobs: false)
         transaction do
           candidates = select_candidates(queue_relation, limit)
-          lock_candidates(candidates, process_id)
+          lock_candidates(candidates, process_id, with_jobs: with_jobs)
         end
       end
 
@@ -40,10 +41,10 @@ module SolidQueue
           queue_relation.ordered.limit(limit).non_blocking_lock.select(:id, :job_id).to_a
         end
 
-        def lock_candidates(executions, process_id)
+        def lock_candidates(executions, process_id, with_jobs:)
           return [] if executions.none?
 
-          SolidQueue::ClaimedExecution.claiming(executions.map(&:job_id), process_id) do |claimed|
+          SolidQueue::ClaimedExecution.claiming(executions.map(&:job_id), process_id, with_jobs: with_jobs) do |claimed|
             ids_to_delete = executions.index_by(&:job_id).values_at(*claimed.map(&:job_id)).map(&:id)
             where(id: ids_to_delete).delete_all
           end

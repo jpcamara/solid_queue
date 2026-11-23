@@ -10,6 +10,8 @@ module SolidQueue
       def for(connection)
         if postgresql?(connection)
           @postgresql ||= Postgresql.new
+        elsif mysql?(connection)
+          @mysql ||= Mysql.new
         else
           @base ||= Base.new
         end
@@ -20,6 +22,11 @@ module SolidQueue
           defined?(ActiveRecord::ConnectionAdapters::PostgreSQLAdapter) &&
             connection.is_a?(ActiveRecord::ConnectionAdapters::PostgreSQLAdapter) &&
             ActiveRecord.version >= Gem::Version.new("8.0")
+        end
+
+        def mysql?(connection)
+          defined?(ActiveRecord::ConnectionAdapters::AbstractMysqlAdapter) &&
+            connection.is_a?(ActiveRecord::ConnectionAdapters::AbstractMysqlAdapter) && !connection.mariadb?
         end
     end
   end
