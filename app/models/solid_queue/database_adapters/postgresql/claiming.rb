@@ -9,16 +9,19 @@ module SolidQueue
         # the claims with their jobs, which are loaded with them. That's instead
         # of selecting, inserting, loading the claims back and deleting, in a
         # transaction, then loading each job on its own before performing it.
+        # It's a statement per queue, as Base has a transaction per queue.
         # Connections that prevent writes claim as in Base.
-        def claim(queue_relation, process_id, limit)
+        def claim(queue_list, process_id, limit)
           ReadyExecution.with_connection do |connection|
             return super if connection.preventing_writes?
 
-            claim_in_one_statement(connection, queue_relation, process_id, limit).tap do |claimed|
-              # As Base, only when there was something to claim
-              if claimed.any?
-                job_ids = claimed.map(&:job_id)
-                SolidQueue.instrument(:claim, process_id: process_id, job_ids: job_ids, size: claimed.size, claimed_job_ids: job_ids)
+            ReadyExecution.claim_from_each_queue(queue_list, limit) do |queue_relation, remaining|
+              claim_in_one_statement(connection, queue_relation, process_id, remaining).tap do |claimed|
+                # As Base, only when there was something to claim
+                if claimed.any?
+                  job_ids = claimed.map(&:job_id)
+                  SolidQueue.instrument(:claim, process_id: process_id, job_ids: job_ids, size: claimed.size, claimed_job_ids: job_ids)
+                end
               end
             end
           end

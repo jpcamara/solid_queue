@@ -31,10 +31,32 @@ module SolidQueue
         job.unblock_next_blocked_job_in_steps
       end
 
-      # Claims up to limit ready executions from queue_relation for the
-      # process, skipping those locked elsewhere, and returns the claims.
-      def claim(queue_relation, process_id, limit)
-        ReadyExecution.claim_in_transaction(queue_relation, process_id, limit)
+      # Makes the jobs ready, running the given block, which does it in the
+      # ready executions table. The models call it for one job or for many.
+      def make_ready(jobs)
+        yield
+      end
+
+      # Schedules the jobs, running the given block, which does it in the
+      # scheduled executions table. Returns what the block returns.
+      def schedule(jobs)
+        yield
+      end
+
+      # Makes up to batch_size scheduled jobs that are due ready, running the
+      # given block, which takes them from the scheduled executions table.
+      # Returns how many were dispatched.
+      def dispatch_scheduled(batch_size)
+        yield
+      end
+
+      # Claims up to limit ready executions from the queues in queue_list, in
+      # their order, for the process, skipping those locked elsewhere, and
+      # returns the claims.
+      def claim(queue_list, process_id, limit)
+        ReadyExecution.claim_from_each_queue(queue_list, limit) do |queue_relation, remaining|
+          ReadyExecution.claim_in_transaction(queue_relation, process_id, remaining)
+        end
       end
 
       # Marks the claim's job finished and deletes the claim, unless the claim

@@ -36,7 +36,7 @@ module SolidQueue
 
         private
           def dispatch_all_at_once(jobs)
-            ReadyExecution.create_all_from_jobs jobs
+            database_adapter.make_ready(jobs) { ReadyExecution.create_all_from_jobs jobs }
           end
 
           # Each job acquires its concurrency lock here, and holds it until the
@@ -110,7 +110,7 @@ module SolidQueue
 
       private
         def ready
-          ReadyExecution.create_or_find_by!(job: self)
+          self.class.database_adapter.make_ready([ self ]) { ReadyExecution.create_or_find_by!(job: self) }
         end
 
         def execution

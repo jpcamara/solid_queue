@@ -73,7 +73,7 @@ module SolidQueue
       end
 
       def promote_to_ready
-        ReadyExecution.create!(ready_attributes)
+        self.class.database_adapter.make_ready([ job ]) { ReadyExecution.create!(ready_attributes) }
       end
 
       def ready_attributes
