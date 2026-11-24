@@ -66,12 +66,6 @@ module SolidQueue
         end
       end
 
-      def clear(key, expected_position)
-        @mutex.synchronize do
-          @positions.delete(key) if @positions[key] == expected_position
-        end
-      end
-
       def discovery_due?(key)
         @mutex.synchronize { due_without_lock?(@next_discovery_at, key) }
       end

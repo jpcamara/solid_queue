@@ -30,16 +30,6 @@ class SolidQueue::ClaimCursorsTest < ActiveSupport::TestCase
     assert_equal [ 1, 1 ], cursors.position(:all)
   end
 
-  test "clear only removes the position it observed" do
-    cursors.advance(:all, [ 0, 10 ])
-
-    cursors.clear(:all, [ 0, 5 ]) # stale observation from a slower thread
-    assert_equal [ 0, 10 ], cursors.position(:all)
-
-    cursors.clear(:all, [ 0, 10 ])
-    assert_nil cursors.position(:all)
-  end
-
   test "reset clears the observed floor source" do
     cursors.observe(42)
     assert_equal 42, cursors.observed_max_id
@@ -137,29 +127,31 @@ class SolidQueue::ClaimCursorsTest < ActiveSupport::TestCase
     assert_equal 0, SolidQueue::ReadyExecution.count
   end
 
-  test "empty seek clears the position and skips cursor queries until discovery is due" do
+  test "an empty seek keeps the position, so the next poll finds new work without discovery" do
     AddToBufferJob.perform_later("seed")
     claim(1)
+    position = cursors.position(:all)
 
     queries = capture_candidate_queries { assert_empty claim(1) }
     assert_equal 1, queries.size
-    assert_nil cursors.position(:all)
+    assert_equal position, cursors.position(:all)
     assert_not cursors.discovery_due?(:all)
 
-    queries = capture_candidate_queries do
-      3.times { assert_empty claim(1) }
-    end
-    assert_empty queries
+    AddToBufferJob.perform_later("next")
+    queries = capture_candidate_queries { assert_equal 1, claim(1).size }
+    assert_equal 1, queries.size
+    assert_includes queries.sole, "(priority, id) > ("
   end
 
   test "higher priority arrivals are picked up once discovery is due" do
     AddToBufferJob.set(priority: 5).perform_later("seed")
     claim(1)
+    position = cursors.position(:all)
 
     AddToBufferJob.set(priority: 1).perform_later("higher")
 
-    assert_empty claim(1)
-    assert_nil cursors.position(:all)
+    assert_empty claim(1) # below the cursor, out of the seek's reach
+    assert_equal position, cursors.position(:all)
 
     cursors.expire_discovery!(:all)
     claimed = claim(1)
@@ -177,7 +169,7 @@ class SolidQueue::ClaimCursorsTest < ActiveSupport::TestCase
     cursors.advance(:all, [ execution.priority, execution.id + 1000 ])
 
     assert_empty claim(1)
-    assert_nil cursors.position(:all)
+    assert_equal [ execution.priority, execution.id + 1000 ], cursors.position(:all)
 
     cursors.expire_discovery!(:all)
     claimed = claim(1)
@@ -329,7 +321,8 @@ class SolidQueue::ClaimCursorsTest < ActiveSupport::TestCase
 
   test "a floored pass with no cursor spans every priority and seeds one" do
     seed_cursor_and_floor(priority: 5)
-    assert_empty claim(1)
+    cursors.expire_full_discovery!(:all)
+    assert_empty claim(1) # a full pass over an empty queue records a floor and no position
     assert_nil cursors.position(:all)
 
     AddToBufferJob.set(priority: 1).perform_later("higher")
@@ -510,7 +503,7 @@ class SolidQueue::ClaimCursorsContentionTest < ActiveSupport::TestCase
     SolidQueue.claim_cursors_discovery_interval = @original_discovery_interval if @original_discovery_interval
   end
 
-  test "rows skipped as locked elsewhere are rediscovered after the peer rolls back" do
+  test "rows skipped as locked elsewhere are claimed after the peer rolls back" do
     AddToBufferJob.perform_later("seed")
     claim(1) # discovery seeds the cursor
 
@@ -521,13 +514,13 @@ class SolidQueue::ClaimCursorsContentionTest < ActiveSupport::TestCase
     peer.execute("BEGIN")
     peer.execute("SELECT id FROM solid_queue_ready_executions WHERE id = #{execution.id} FOR UPDATE")
 
+    position = SolidQueue::ReadyExecution.claim_cursors.position(:all)
     assert_empty claim(1) # the only row is locked, so the seek looks empty
-    assert_nil SolidQueue::ReadyExecution.claim_cursors.position(:all)
+    assert_equal position, SolidQueue::ReadyExecution.claim_cursors.position(:all)
 
     peer.execute("ROLLBACK")
 
-    SolidQueue::ReadyExecution.claim_cursors.expire_discovery!(:all)
-    claimed = claim(1)
+    claimed = claim(1) # still above the kept position, so the next seek finds it
 
     assert_equal 1, claimed.size
     assert_equal "contended", SolidQueue::Job.find(claimed.sole.job_id).arguments.dig("arguments").first

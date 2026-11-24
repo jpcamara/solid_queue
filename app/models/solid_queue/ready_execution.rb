@@ -142,13 +142,13 @@ module SolidQueue
             queue_relation.where("(priority, id) > (?, ?)", *position), process_id, limit
           )
 
+          # An empty seek keeps the position: new rows get higher ids, so the next
+          # poll's seek finds them without waiting for discovery. Rows a seek
+          # can't reach (below the position, or skipped as locked and rolled
+          # back below it) are left to discovery, as before.
           if candidates.any?
             claim_cursors.observe(candidates.map(&:id).max)
             claim_cursors.advance(key, position_of(candidates.last))
-          else
-            # Under SKIP LOCKED, empty can also mean every remaining row was
-            # locked elsewhere; either way the next discovery re-checks
-            claim_cursors.clear(key, position)
           end
 
           claimed
