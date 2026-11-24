@@ -4,11 +4,11 @@ module SolidQueue
   class Worker < Processes::Poller
     include LifecycleHooks
 
-    after_boot :run_start_hooks
+    after_boot :start_finisher, :run_start_hooks
     before_shutdown :run_stop_hooks
     after_shutdown :run_exit_hooks
 
-    attr_reader :queues, :pool
+    attr_reader :queues, :pool, :finisher
 
     def initialize(**options)
       execution_pool_type = options.key?(:fibers) ? :fiber : :thread
@@ -25,6 +25,8 @@ module SolidQueue
         on_idle: -> { wake_up },
         on_unrecoverable_error: -> { request_termination }
 
+      @finisher = Finisher.new(execution_pool_size, on_unrecoverable_error: -> { request_termination })
+
       super(**options)
     end
 
@@ -36,6 +38,7 @@ module SolidQueue
       def poll
         claim_executions.then do |executions|
           executions.each do |execution|
+            execution.finisher = finisher
             pool.post(execution)
           end
 
@@ -60,8 +63,14 @@ module SolidQueue
       def shutdown
         pool.shutdown
         pool.wait_for_termination(SolidQueue.shutdown_timeout)
+        # Before deregistering, which releases the claims left
+        finisher.stop(SolidQueue.shutdown_timeout)
 
         super
+      end
+
+      def start_finisher
+        finisher.start
       end
 
       def all_work_completed?
