@@ -102,7 +102,7 @@ class ConfigurationTest < ActiveSupport::TestCase
       )
 
       assert configuration.valid?
-      assert_match /needs at least 1002 database connections/, configuration.warnings.full_messages.first
+      assert_match /needs at least 1003 database connections/, configuration.warnings.full_messages.first
     end
   end
 

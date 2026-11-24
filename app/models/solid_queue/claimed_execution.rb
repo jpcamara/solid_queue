@@ -6,6 +6,11 @@ module SolidQueue
 
     scope :orphaned, -> { where.missing(:process) }
 
+    # A worker's SolidQueue::Finisher, which finishes the execution together
+    # with others once it has run successfully, unless its job is
+    # concurrency-limited. Otherwise, it's finished right away.
+    attr_accessor :finisher
+
     class Result < Struct.new(:success, :error)
       def success?
         success
@@ -78,11 +83,20 @@ module SolidQueue
       result = execute
 
       if result.success?
-        finalizing { finished }
+        # A limited job's slot is given to the next job at once
+        if finisher && !job.concurrency_limited? then finisher.finish(self)
+        else finish
+        end
       else
         finalizing { failed_with(result.error) }
         raise result.error
       end
+    end
+
+    # Marks the job finished and deletes the claim, then unblocks the next
+    # job if the job is concurrency-limited
+    def finish
+      finalizing { finished }
     end
 
     def release
