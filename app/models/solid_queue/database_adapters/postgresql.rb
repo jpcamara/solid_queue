@@ -2,8 +2,10 @@
 
 module SolidQueue
   module DatabaseAdapters
-    # Used on PostgreSQL with Active Record 8 or later.
+    # Used on PostgreSQL with Active Record 8 or later. Each operation it runs
+    # its own way is in a module of its own.
     class Postgresql < Base
+      include Claiming, Finishing
     end
   end
 end
