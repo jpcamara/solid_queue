@@ -19,6 +19,18 @@ module SolidQueue
         Job.create_all_and_prepare_for_execution(active_jobs)
       end
 
+      # Releases a blocked execution if its job gets a concurrency slot,
+      # making the job ready, and fails a job whose class doesn't load.
+      def release(blocked_execution)
+        blocked_execution.release_in_steps
+      end
+
+      # Gives back the concurrency slot the job holds, if any, and releases
+      # the next job blocked on its concurrency key.
+      def unblock_next(job)
+        job.unblock_next_blocked_job_in_steps
+      end
+
       # Claims up to limit ready executions from queue_relation for the
       # process, skipping those locked elsewhere, and returns the claims.
       def claim(queue_relation, process_id, limit)

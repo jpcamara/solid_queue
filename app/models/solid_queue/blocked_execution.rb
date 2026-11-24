@@ -44,6 +44,12 @@ module SolidQueue
     end
 
     def release
+      self.class.database_adapter.release(self)
+    end
+
+    # The release that works on every database, a statement at a time.
+    # DatabaseAdapters::Base#release runs it.
+    def release_in_steps
       SolidQueue.instrument(:release_blocked, job_id: job.id, concurrency_key: concurrency_key, released: false) do |payload|
         transaction do
           if job.job_class.nil?

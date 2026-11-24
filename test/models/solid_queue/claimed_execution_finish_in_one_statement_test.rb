@@ -34,9 +34,10 @@ class SolidQueue::ClaimedExecutionFinishInOneStatementTest < ActiveSupport::Test
     assert_equal [ job.finished_at, job.updated_at ], SolidQueue::Job.find(job.id).values_at(:finished_at, :updated_at)
 
     if postgresql?
-      assert_equal [ "BEGIN", "WITH", "COMMIT" ], verbs(statements), statements
-      assert_match(/DELETE FROM "solid_queue_claimed_executions".*UPDATE "solid_queue_jobs"/, statements.second)
+      assert_equal finish_verbs, verbs(statements), statements
+      assert_match(/DELETE FROM "solid_queue_claimed_executions".*UPDATE "solid_queue_jobs"/, statements.grep(/\AWITH/).sole)
     else
+      assert statements.none? { |sql| sql.start_with?("WITH") }, statements
       assert_operator statements.size, :>, 1
     end
   end
@@ -61,7 +62,7 @@ class SolidQueue::ClaimedExecutionFinishInOneStatementTest < ActiveSupport::Test
     assert SolidQueue::Job.find(first.job_id).finished?
     assert second.reload.ready?
     assert_equal 0, SolidQueue::Semaphore.find_by!(key: second.concurrency_key).value
-    assert_equal [ "BEGIN", "WITH", "COMMIT" ], verbs(statements).first(3), statements if postgresql?
+    assert_equal finish_verbs, verbs(statements).first(finish_verbs.size), statements if postgresql?
   end
 
   test "a job left unfinished because its claim is gone doesn't release its lock" do
@@ -144,15 +145,16 @@ class SolidQueue::ClaimedExecutionFinishInOneStatementTest < ActiveSupport::Test
     job = SolidQueue::Job.find(claimed_execution.job_id)
     assert job.finished?
     assert_equal updated_at, job.updated_at
-    assert_equal [ "BEGIN", "WITH", "COMMIT" ], verbs(statements), statements if postgresql?
+    assert_equal finish_verbs, verbs(statements), statements if postgresql?
   end
 
   test "a statement that fails leaves the claim, and raises FinalizationError" do
     claimed_execution = claim(AddToBufferJob.perform_later(1))
     skip unless postgresql?
-    SolidQueue::Record.database_adapter.stubs(:delete_claim_and_finish_job).raises(ActiveRecord::StatementInvalid.new("transient DB glitch"))
+    SolidQueue::Record.database_adapter.stubs(:finish_sql).returns("UPDATE solid_queue_jobs SET missing_column = $2 WHERE id = $1 RETURNING id")
 
-    assert_raises(SolidQueue::ClaimedExecution::FinalizationError) { claimed_execution.perform }
+    error = assert_raises(SolidQueue::ClaimedExecution::FinalizationError) { claimed_execution.perform }
+    assert_kind_of ActiveRecord::StatementInvalid, error.cause
 
     assert SolidQueue::ClaimedExecution.exists?(claimed_execution.id)
     assert_not SolidQueue::Job.find(claimed_execution.job_id).finished?
@@ -209,6 +211,14 @@ class SolidQueue::ClaimedExecutionFinishInOneStatementTest < ActiveSupport::Test
 
     def postgresql?
       SolidQueue::Record.connection.adapter_name == "PostgreSQL"
+    end
+
+    def finish_verbs
+      if PG.library_version >= 18_00_00 && Gem::Version.new(PG::VERSION) < Gem::Version.new("1.6.0")
+        [ "BEGIN", "WITH", "COMMIT" ]
+      else
+        [ "WITH" ]
+      end
     end
 
     def verbs(statements)
