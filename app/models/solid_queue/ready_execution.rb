@@ -8,8 +8,17 @@ module SolidQueue
 
     class << self
       def claim(queue_list, limit, process_id)
+        database_adapter.claim(queue_list, process_id, limit)
+      end
+
+      # Yields each queue's relation from queue_list, in order, with how many
+      # are left to claim of limit, given what the block returned for the
+      # queues before, and returns all it returned.
+      def claim_from_each_queue(queue_list, limit)
         QueueSelector.new(queue_list, self).scoped_relations.flat_map do |queue_relation|
-          select_and_lock(queue_relation, process_id, limit).tap do |locked|
+          next [] if limit <= 0
+
+          yield(queue_relation, limit).tap do |locked|
             limit -= locked.size
           end
         end
@@ -29,12 +38,6 @@ module SolidQueue
       end
 
       private
-        def select_and_lock(queue_relation, process_id, limit)
-          return [] if limit <= 0
-
-          database_adapter.claim(queue_relation, process_id, limit)
-        end
-
         def select_candidates(queue_relation, limit)
           # Force query execution here with #to_a to avoid unintended FOR UPDATE query executions
           queue_relation.ordered.limit(limit).non_blocking_lock.select(:id, :job_id).to_a

@@ -13,8 +13,10 @@ module SolidQueue
 
       class_methods do
         def schedule_all(jobs)
-          schedule_all_at_once(jobs)
-          successfully_scheduled(jobs)
+          database_adapter.schedule(jobs) do
+            schedule_all_at_once(jobs)
+            successfully_scheduled(jobs)
+          end
         end
 
         private
@@ -38,7 +40,7 @@ module SolidQueue
 
       private
         def schedule
-          ScheduledExecution.create_or_find_by!(job: self)
+          self.class.database_adapter.schedule([ self ]) { ScheduledExecution.create_or_find_by!(job: self) }
         end
 
         def execution

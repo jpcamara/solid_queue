@@ -45,6 +45,10 @@ module SolidQueue
   mattr_accessor :clear_finished_jobs_after, default: 1.day
   mattr_accessor :default_concurrency_control_period, default: 3.minutes
 
+  # An adapter to run Solid Queue's operations instead of the one chosen for
+  # the database, such as a subclass of DatabaseAdapters::Base
+  mattr_accessor :database_adapter
+
   mattr_reader :time_zone
 
   def time_zone=(zone)

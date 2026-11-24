@@ -455,6 +455,7 @@ There are several settings that control how Solid Queue works that you can set a
 - `preserve_finished_jobs`: whether to keep finished jobs in the `solid_queue_jobs` table—defaults to `true`.
 - `clear_finished_jobs_after`: period to keep finished jobs around, in case `preserve_finished_jobs` is true — defaults to 1 day. When installing Solid Queue, [a recurring job](#recurring-tasks) is automatically configured to clear finished jobs every hour on the 12th minute in batches. You can edit the `recurring.yml` configuration to change this as you see fit.
 - `default_concurrency_control_period`: the value to be used as the default for the `duration` parameter in [concurrency controls](#concurrency-controls). It defaults to 3 minutes.
+- `database_adapter`: an object that runs Solid Queue's database operations (enqueuing, making jobs ready, scheduling, claiming, finishing and releasing them) instead of the adapter Solid Queue picks for the database. It's meant for gems that keep jobs elsewhere, and should subclass `SolidQueue::DatabaseAdapters::Base`, overriding what they do differently. `nil` by default.
 
 ### Validating the configuration
 
