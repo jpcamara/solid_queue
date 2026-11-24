@@ -248,16 +248,25 @@ class SolidQueue::JobTest < ActiveSupport::TestCase
   test "enqueue jobs in bulk acquiring their concurrency locks by key" do
     results = 3.times.map { JobResult.create!(queue_name: "default") }
 
-    acquired = []
-    SolidQueue::Semaphore.stubs(:wait).with { |job| acquired << [ job.concurrency_key, job.id ] }.returns(true)
-
     # Two jobs for each key, with the keys in descending order
     active_jobs = (results.reverse + results.reverse).map { |result| NonOverlappingJob.new(result) }
-    ActiveJob.perform_all_later(active_jobs)
 
-    # By key and, within a key, in the order they were enqueued
-    assert_equal 6, acquired.size
-    assert_equal acquired.sort, acquired
+    if SolidQueue::Record.connection.adapter_name == "PostgreSQL" && ActiveRecord.version >= Gem::Version.new("8.0")
+      # The semaphores for the whole set are created or locked by one statement, by key
+      locked = []
+      callback = ->(*, payload) { locked.concat(JSON.parse(payload[:binds].first.value).pluck("key")) if payload[:name] == "SolidQueue::Semaphore Create All" }
+      ActiveSupport::Notifications.subscribed(callback, "sql.active_record") { ActiveJob.perform_all_later(active_jobs) }
+
+      assert_equal active_jobs.map(&:concurrency_key).uniq.sort, locked
+    else
+      acquired = []
+      SolidQueue::Semaphore.stubs(:wait).with { |job| acquired << [ job.concurrency_key, job.id ] }.returns(true)
+      ActiveJob.perform_all_later(active_jobs)
+
+      # By key and, within a key, in the order they were enqueued
+      assert_equal 6, acquired.size
+      assert_equal acquired.sort, acquired
+    end
   end
 
   test "discard ready job" do

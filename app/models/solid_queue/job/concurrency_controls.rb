@@ -61,6 +61,10 @@ module SolidQueue
         concurrency_lock&.dig("limit")
       end
 
+      def concurrency_on_conflict
+        job_class.concurrency_on_conflict.to_s.inquiry
+      end
+
       def blocked?
         blocked_execution.present?
       end
@@ -107,10 +111,6 @@ module SolidQueue
           else
             block
           end
-        end
-
-        def concurrency_on_conflict
-          job_class.concurrency_on_conflict.to_s.inquiry
         end
 
         def block

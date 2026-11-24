@@ -14,6 +14,7 @@ module SolidQueue
     end
 
     include Executable, Clearable, Recurrable, Batchable
+    include ReadyOnInsert
 
     serialize :arguments, coder: JSON
 
@@ -29,8 +30,7 @@ module SolidQueue
         active_jobs_by_job_id = active_jobs.index_by(&:job_id)
 
         transaction do
-          jobs = create_all_from_active_jobs(active_jobs)
-          prepare_all_for_execution(jobs).tap do |enqueued_jobs|
+          database_adapter.enqueue_all(active_jobs).tap do |enqueued_jobs|
             enqueued_jobs.each do |enqueued_job|
               active_jobs_by_job_id[enqueued_job.active_job_id].provider_job_id = enqueued_job.id
               active_jobs_by_job_id[enqueued_job.active_job_id].successfully_enqueued = true
@@ -50,6 +50,33 @@ module SolidQueue
         end
       end
 
+      # The bulk enqueue that works on every database, in the caller's
+      # transaction. DatabaseAdapters::Base#enqueue_all runs it.
+      def create_all_and_prepare_for_execution(active_jobs)
+        prepare_all_for_execution(create_all_from_active_jobs(active_jobs))
+      end
+
+      # Inserts the rows given by attributes_from_active_job, and returns
+      # their jobs.
+      def create_all_from_rows(job_rows)
+        insert_all(job_rows)
+        where(active_job_id: job_rows.map { |attributes| attributes[:active_job_id] }).order(id: :asc)
+      end
+
+      def attributes_from_active_job(active_job)
+        {
+          queue_name: active_job.queue_name || DEFAULT_QUEUE_NAME,
+          active_job_id: active_job.job_id,
+          priority: active_job.priority || DEFAULT_PRIORITY,
+          scheduled_at: active_job.scheduled_at,
+          class_name: active_job.class.name,
+          arguments: active_job.serialize,
+          concurrency_key: active_job.concurrency_key
+        }.tap do |attributes|
+          attributes[:batch_id] = active_job.batch_id if Batch.migrated?
+        end
+      end
+
       private
         DEFAULT_PRIORITY = 0
         DEFAULT_QUEUE_NAME = "default"
@@ -64,23 +91,7 @@ module SolidQueue
         end
 
         def create_all_from_active_jobs(active_jobs)
-          job_rows = active_jobs.map { |job| attributes_from_active_job(job) }
-          insert_all(job_rows)
-          where(active_job_id: active_jobs.map(&:job_id)).order(id: :asc)
-        end
-
-        def attributes_from_active_job(active_job)
-          {
-            queue_name: active_job.queue_name || DEFAULT_QUEUE_NAME,
-            active_job_id: active_job.job_id,
-            priority: active_job.priority || DEFAULT_PRIORITY,
-            scheduled_at: active_job.scheduled_at,
-            class_name: active_job.class.name,
-            arguments: active_job.serialize,
-            concurrency_key: active_job.concurrency_key
-          }.tap do |attributes|
-            attributes[:batch_id] = active_job.batch_id if Batch.migrated?
-          end
+          create_all_from_rows active_jobs.map { |job| attributes_from_active_job(job) }
         end
     end
   end

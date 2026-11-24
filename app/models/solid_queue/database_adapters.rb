@@ -1,7 +1,7 @@
 # frozen_string_literal: true
 
 module SolidQueue
-  # The SQL behind claiming and finishing jobs, by database. Base runs the
+  # The SQL behind enqueuing, claiming and finishing jobs, by database. Base runs the
   # models' code that works on every database; a database's adapter overrides
   # an operation it can do in fewer statements, and falls back to Base when it
   # can't.
