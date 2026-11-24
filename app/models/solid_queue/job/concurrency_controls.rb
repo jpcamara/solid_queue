@@ -114,7 +114,7 @@ module SolidQueue
         end
 
         def block
-          BlockedExecution.create_or_find_by!(job: self)
+          BlockedExecution.database_adapter.create_execution(BlockedExecution, self)
         end
 
         def execution

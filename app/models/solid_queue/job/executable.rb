@@ -110,7 +110,7 @@ module SolidQueue
 
       private
         def ready
-          ReadyExecution.create_or_find_by!(job: self)
+          ReadyExecution.database_adapter.create_execution(ReadyExecution, self)
         end
 
         def execution

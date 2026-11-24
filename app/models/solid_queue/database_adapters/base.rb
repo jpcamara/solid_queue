@@ -16,6 +16,11 @@ module SolidQueue
       def finish(claimed_execution)
         claimed_execution.finalize_claim { claimed_execution.job.finished! }
       end
+
+      # Creates the job's execution of this kind, or finds the one it has.
+      def create_execution(execution_class, job)
+        execution_class.create_or_find_by!(job: job)
+      end
     end
   end
 end
