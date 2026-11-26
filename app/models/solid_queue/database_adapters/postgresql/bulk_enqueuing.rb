@@ -72,12 +72,10 @@ module SolidQueue
             expiries = by_key.transform_values { |jobs| connection.quoted_date(jobs.first.class.concurrency_duration.from_now) }
 
             lock_batches(connection, active_jobs)
-            created = create_semaphores(connection, by_key.map { |key, jobs| { key:, value: limits[key] - [ jobs.size, limits[key] ].min, expires_at: expiries[key] } }, now)
-            existing = by_key.keys - created.keys
-            from_existing = existing.any? ? take_from_semaphores(connection, existing.map { |key| { key:, n: by_key[key].size, expires_at: expiries[key] } }) : {}
+            taken = take_slots_for_all(connection, by_key.map { |key, jobs| { key:, n: jobs.size, limit: limits[key], expires_at: expiries[key] } }, now)
 
             by_key.each_with_object({}) do |(key, jobs), slots|
-              semaphore_id, count = created.key?(key) ? [ created[key], [ jobs.size, limits[key] ].min ] : from_existing.fetch(key, [ nil, 0 ])
+              semaphore_id, count = taken[key]
               jobs.each_with_index do |job, index|
                 slots[job.job_id] = ({ "semaphore_id" => semaphore_id, "limit" => limits[key] } if index < count)
               end
@@ -99,35 +97,6 @@ module SolidQueue
             connection.exec_query(<<~SQL.squish, "#{Batch.name} Lock All", [ json_bind(batch_ids) ])
               SELECT id FROM #{Batch.quoted_table_name}
               WHERE id IN (SELECT value::bigint FROM json_array_elements_text($1::json)) ORDER BY id FOR NO KEY UPDATE
-            SQL
-          end
-
-          # Inserts the semaphores that don't exist yet, and locks the ones that
-          # do: the update's condition is never met, but the row is still locked.
-          # Returns the ids of those inserted, by key.
-          def create_semaphores(connection, rows, now)
-            connection.exec_query(<<~SQL.squish, "#{Semaphore.name} Create All", [ json_bind(rows), time_bind(now) ]).rows.to_h { |id, key| [ key, id ] }
-              INSERT INTO #{Semaphore.quoted_table_name} (key, value, expires_at, created_at, updated_at)
-              SELECT key, value, expires_at, $2, $2 FROM json_to_recordset($1::json) AS wanted(key text, value integer, expires_at timestamp)
-              ON CONFLICT (key) DO UPDATE SET value = #{Semaphore.quoted_table_name}.value WHERE false
-              RETURNING id, key
-            SQL
-          end
-
-          # Takes up to n slots from each existing, and now locked, semaphore.
-          # Returns its id and how many it gave, by key.
-          def take_from_semaphores(connection, rows)
-            connection.exec_query(<<~SQL.squish, "#{Semaphore.name} Take All", [ json_bind(rows) ]).rows.to_h { |id, key, count| [ key, [ id, count ] ] }
-              WITH wanted AS (
-                SELECT * FROM json_to_recordset($1::json) AS wanted(key text, n integer, expires_at timestamp)
-              ), taken AS (
-                SELECT semaphores.id, semaphores.key, LEAST(wanted.n, GREATEST(semaphores.value, 0)) AS count, wanted.expires_at
-                FROM #{Semaphore.quoted_table_name} semaphores JOIN wanted ON wanted.key = semaphores.key
-              ), updated AS (
-                UPDATE #{Semaphore.quoted_table_name} SET value = #{Semaphore.quoted_table_name}.value - taken.count, expires_at = taken.expires_at
-                FROM taken WHERE #{Semaphore.quoted_table_name}.id = taken.id AND taken.count > 0
-              )
-              SELECT id, key, count FROM taken
             SQL
           end
 

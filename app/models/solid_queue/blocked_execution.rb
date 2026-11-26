@@ -35,11 +35,9 @@ module SolidQueue
       end
 
       private
+        # Concurrency keys without semaphore + concurrency keys with open semaphore
         def releasable(concurrency_keys)
-          semaphores = Semaphore.where(key: concurrency_keys).pluck(:key, :value).to_h
-
-          # Concurrency keys without semaphore + concurrency keys with open semaphore
-          (concurrency_keys - semaphores.keys) | semaphores.select { |_key, value| value > 0 }.keys
+          database_adapter.keys_with_free_slots(concurrency_keys)
         end
     end
 

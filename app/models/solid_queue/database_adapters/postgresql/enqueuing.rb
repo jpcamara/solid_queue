@@ -75,16 +75,8 @@ module SolidQueue
               expires_at, limit = bind.(job.concurrency_duration.from_now, Semaphore, :expires_at), bind.(job.concurrency_limit, Semaphore, :value)
               now = bind.(Time.current, Semaphore, :created_at)
 
-              ctes << <<~SQL
-                semaphore AS (
-                  INSERT INTO #{Semaphore.quoted_table_name} (key, value, expires_at, created_at, updated_at)
-                  SELECT #{bind.(job.concurrency_key, Semaphore, :key)}, #{limit} - 1, #{expires_at}, #{now}, #{now}
-                  #{"WHERE #{inserted_if}" if inserted_if}
-                  ON CONFLICT (key) DO UPDATE SET value = #{Semaphore.quoted_table_name}.value - 1, expires_at = EXCLUDED.expires_at
-                  WHERE #{Semaphore.quoted_table_name}.value > 0
-                  RETURNING id
-                )
-              SQL
+              key = bind.(job.concurrency_key, Semaphore, :key)
+              ctes << "semaphore AS (#{take_slot_sql(key:, limit:, expires_at:, now:, condition: inserted_if)})"
               ready_if = "WHERE EXISTS (SELECT 1 FROM semaphore)"
 
               arguments = values.keys.index { |name| name.to_s == "arguments" }
