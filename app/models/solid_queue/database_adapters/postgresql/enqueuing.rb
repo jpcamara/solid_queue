@@ -118,15 +118,18 @@ module SolidQueue
 
             sql = "WITH #{ctes.join(", ")} SELECT #{returned.join(", ")} FROM job".squish
 
-            eligible = job.saving_in_own_transaction? && connection.open_transactions == 1 &&
-              !connection.current_transaction.materialized? && !connection.current_transaction.isolation_level &&
-              nothing_written_after_insert?(job)
-
             # As the INSERT it replaces would
             ActiveRecord::Base.clear_query_caches_for_current_thread if connection.pool.dirties_query_cache
 
-            with_statement_autocommit(connection, eligible: eligible) do |autocommit|
-              connection.internal_exec_query(sql, "#{Job.name} Create", binds, materialize_transactions: !autocommit).rows.first
+            with_slots_locked(connection, job.concurrency_limited? ? [ job.concurrency_key ] : []) do
+              # Not when locking the key ran a statement in the transaction first
+              eligible = job.saving_in_own_transaction? && connection.open_transactions == 1 &&
+                !connection.current_transaction.materialized? && !connection.current_transaction.isolation_level &&
+                nothing_written_after_insert?(job)
+
+              with_statement_autocommit(connection, eligible: eligible) do |autocommit|
+                connection.internal_exec_query(sql, "#{Job.name} Create", binds, materialize_transactions: !autocommit).rows.first
+              end
             end
           end
 

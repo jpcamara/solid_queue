@@ -24,6 +24,13 @@ class SolidQueue::SemaphoreLogTest < ActiveSupport::TestCase
     end
   end
 
+  class LimitedToZeroJob < ApplicationJob
+    limits_concurrency key: ->(value) { value }, to: 0, group: "semaphore log zero", duration: 3.minutes
+
+    def perform(value)
+    end
+  end
+
   LOG = "solid_queue_semaphore_log"
 
   setup do
@@ -50,7 +57,7 @@ class SolidQueue::SemaphoreLogTest < ActiveSupport::TestCase
     assert_equal 0, SolidQueue::Semaphore.count
   end
 
-  test "a finished job hands its slot to the next blocked job in one statement, adding a row" do
+  test "a finished job hands its slot to the next blocked job in one statement after locking the key, adding a row" do
     holder, _other, blocked = 3.times.map { enqueue(LimitedToTwoJob, "a") }
 
     statements = capturing_statements { assert holder.unblock_next_blocked_job }
@@ -59,8 +66,9 @@ class SolidQueue::SemaphoreLogTest < ActiveSupport::TestCase
     assert_not blocked.blocked?
     assert_equal [ 1, 0, 0 ], log("a").map { |row| row["value"] }
     assert_equal holder.acquired_semaphore_id, blocked.acquired_semaphore_id
-    assert_equal [ "WITH" ], verbs(statements), statements
-    assert_match(/solid_queue_semaphore_held.*FOR UPDATE SKIP LOCKED.*solid_queue_semaphore_signal/, statements.first)
+    assert_equal [ "SELECT", "WITH" ], verbs(statements), statements
+    assert_match(/pg_advisory_xact_lock/, statements.first)
+    assert_match(/FOR UPDATE SKIP LOCKED.*INSERT INTO solid_queue_semaphore_log/, statements.last)
   end
 
   test "with no job blocked, a finished job gives its slot back" do
@@ -70,11 +78,20 @@ class SolidQueue::SemaphoreLogTest < ActiveSupport::TestCase
     assert_equal [ 1, 2 ], log("a").map { |row| row["value"] }
   end
 
-  test "a job enqueued on its own takes its slot in the statement that inserts it" do
+  test "a job enqueued on its own takes its slot in the statement that inserts it, after locking the key" do
     statements = capturing_statements { LimitedToTwoJob.perform_later("a") }
 
-    assert_equal [ "WITH" ], verbs(statements), statements
-    assert_match(/solid_queue_semaphore_wait/, statements.first)
+    assert_equal [ "SELECT", "WITH" ], verbs(statements), statements
+    assert_match(/pg_advisory_xact_lock/, statements.first)
+    assert_match(/INSERT INTO solid_queue_semaphore_log/, statements.last)
+  end
+
+  test "a key's first job creates its semaphore and runs, even with a limit of zero, as with the semaphores table" do
+    first, second = 2.times.map { enqueue(LimitedToZeroJob, "z") }
+
+    assert first.ready?
+    assert second.blocked?
+    assert_equal [ -1 ], log("semaphore log zero/z").map { |row| row["value"] }
   end
 
   test "a semaphore that has expired is gone: its key is free, and its jobs' slots aren't given back to the next one" do
@@ -105,7 +122,7 @@ class SolidQueue::SemaphoreLogTest < ActiveSupport::TestCase
     end
   end
 
-  test "perform_all_later takes the slots for its limited jobs in one statement" do
+  test "perform_all_later takes the slots for its limited jobs in one statement, after locking their keys" do
     enqueue(LimitedToTwoJob, "a")
     jobs = [ LimitedToTwoJob.new("a"), LimitedToTwoJob.new("a"), LimitedToTwoJob.new("b"), AddToBufferJob.new(1) ]
 
@@ -116,7 +133,8 @@ class SolidQueue::SemaphoreLogTest < ActiveSupport::TestCase
     assert enqueued[jobs[1].job_id].blocked?
     assert_equal [ 1, 0 ], log("a").map { |row| row["value"] }
     assert_equal [ 1 ], log("b").map { |row| row["value"] }
-    assert_equal 1, statements.count { |sql| sql.include?("solid_queue_semaphore_wait_all") }, statements
+    assert_equal 1, statements.count { |sql| sql.include?("pg_advisory_xact_lock") }, statements
+    assert_equal 1, statements.count { |sql| sql.include?("INSERT INTO solid_queue_semaphore_log") }, statements
   end
 
   test "jobs released or given back a slot one statement at a time also use the log" do
@@ -194,35 +212,19 @@ class SolidQueue::SemaphoreLogTest < ActiveSupport::TestCase
     assert_equal 0, log(key).last["value"]
   end
 
-  test "rotation copies each key's newest live row out of the partition written to two periods ago, and truncates it" do
-    stale = partition(part + 1)
-    current = partition(part)
-    insert_row(stale, id: 1, key: "live", value: 1)
-    insert_row(stale, id: 2, key: "expired", value: 1, expires_at: 1.minute.ago)
-    insert_row(stale, id: 3, key: "moved on", value: 1)
-    insert_row(current, id: 4, key: "moved on", value: 0)
+  test "maintenance deletes the rows newer ones replaced and the expired ones, in batches, keeping each key's semaphore" do
+    insert_row(id: 1, key: "full", value: 1)
+    insert_row(id: 2, key: "expired", value: 1, expires_at: 1.minute.ago)
+    insert_row(id: 3, key: "full", value: 0)
+    insert_row(id: 4, key: "alone", value: 1)
+    connection.execute("SELECT setval('#{LOG}_id_seq', 100)")
 
-    assert_equal 1, SolidQueue::DatabaseAdapters.for(connection).expire_semaphores(100)
+    statements = capturing_statements { SolidQueue::DatabaseAdapters.for(connection).expire_semaphores(1) }
 
-    assert_equal 0, connection.select_value("SELECT count(*) FROM #{stale}")
-    assert_equal [ [ 1, key_of("live"), 1 ], [ 4, key_of("moved on"), 0 ] ], connection.select_rows("SELECT id, key, value FROM #{current} ORDER BY id")
-    assert enqueue(LimitedToTwoJob, "live").ready?
-    assert_equal [ 1, 0 ], log("live").map { |row| row["value"] }
-  end
-
-  test "rotation is left for later while a transaction that read the log is open" do
-    stale = partition(part + 1)
-    insert_row(stale, id: 1, key: "live", value: 1)
-
-    reader = SolidQueue::Record.connection_pool.checkout
-    reader.begin_db_transaction
-    reader.select_value("SELECT count(*) FROM #{LOG}")
-
-    assert_nil SolidQueue::DatabaseAdapters.for(connection).expire_semaphores(100)
-    assert_equal 1, connection.select_value("SELECT count(*) FROM #{stale}")
-  ensure
-    reader&.rollback_db_transaction
-    SolidQueue::Record.connection_pool.checkin(reader) if reader
+    assert_equal [ 3, 4 ], connection.select_values("SELECT id FROM #{LOG} ORDER BY id")
+    assert_equal 3, statements.grep(/\ADELETE/).size, statements
+    assert enqueue(LimitedToOneJob, "full").blocked?
+    assert enqueue(LimitedToOneJob, "expired").ready?
   end
 
   private
@@ -255,17 +257,9 @@ class SolidQueue::SemaphoreLogTest < ActiveSupport::TestCase
       "semaphore log one/#{key}"
     end
 
-    def part
-      connection.select_value("SELECT solid_queue_semaphore_log_part()")
-    end
-
-    def partition(part)
-      "#{LOG}_#{part % 3}"
-    end
-
-    def insert_row(table, id:, key:, value:, expires_at: 3.minutes.from_now)
-      connection.exec_query("INSERT INTO #{table} (id, part, key, semaphore_id, value, expires_at, created_at) VALUES ($1, $2, $3, $1, $4, $5, $6)",
-        "insert", [ id, table[-1].to_i, key_of(key), value, expires_at.utc, Time.now.utc ])
+    def insert_row(id:, key:, value:, expires_at: 3.minutes.from_now)
+      connection.exec_query("INSERT INTO #{LOG} (id, key, semaphore_id, value, expires_at, created_at) VALUES ($1, $2, $1, $3, $4, $5)",
+        "insert", [ id, one_key_of(key), value, expires_at.utc, Time.now.utc ])
     end
 
     def advisory_lock_waiters

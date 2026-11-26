@@ -652,7 +652,7 @@ When jobs that have concurrency controls and `on_conflict: :discard` are enqueue
 
 Every job with concurrency controls updates its key's row in `solid_queue_semaphores` when it takes a slot and again when it gives it back. Each update leaves a dead row version behind, which vacuum can't remove while any older transaction is open, on the primary or, with `hot_standby_feedback`, on a replica. A busy key then collects thousands of dead versions, and every lookup of it walks through them.
 
-On PostgreSQL 12 or later, semaphores can be kept in a log that only ever has rows inserted instead. A key's semaphore is its newest row, found with one index lookup however many rows came before it, and callers on a key take turns through an advisory lock rather than a row lock. Old rows go when their partition is truncated by the dispatcher's concurrency maintenance, which doesn't wait for vacuum. To use it:
+On PostgreSQL, semaphores can be kept in a log instead, where taking or giving back a slot inserts a row. A key's semaphore is its newest row, found with one index lookup however many rows came before it, and callers on a key take turns through an advisory lock rather than a row lock. The dispatcher's concurrency maintenance deletes the rows that newer ones replaced; lookups never read them, so they cost space, not time, until vacuum removes them. To use it:
 
 ```bash
 bin/rails generate solid_queue:semaphore_log
@@ -665,8 +665,8 @@ SolidQueue.database_adapter = SolidQueue::DatabaseAdapters::PostgresqlWithSemaph
 ```
 
 Things to know:
-- Schema dumps in Ruby leave out the log's partitioned table and functions, so the queue database needs `schema_format: :sql`.
 - Jobs with concurrency controls must be enqueued in READ COMMITTED transactions, PostgreSQL's default. In a REPEATABLE READ or SERIALIZABLE transaction, taking a slot raises an error, since the transaction couldn't see the latest state.
+- Taking or giving back a slot locks the key in a statement of its own first, so it runs in a transaction: a job with concurrency controls is enqueued with BEGIN, the lock, the insert and COMMIT, instead of one statement.
 - A semaphore is gone as soon as it expires. With `solid_queue_semaphores`, an expired semaphore is deleted the next time the dispatcher's concurrency maintenance runs.
 - The log doesn't count slots taken from `solid_queue_semaphores` before you switch, so until those jobs finish, a key can have up to twice its limit running. Switch when no jobs with concurrency controls are running if that matters.
 - Jobs waiting for a slot are still kept in `solid_queue_blocked_executions`.

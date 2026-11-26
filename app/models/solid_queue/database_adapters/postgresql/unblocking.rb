@@ -72,7 +72,7 @@ module SolidQueue
               ActiveRecord::Base.clear_query_caches_for_current_thread if connection.pool.dirties_query_cache
 
               # Prepared, which Active Record only does for a string when told it can
-              connection.select_all(<<~SQL.squish, "#{Job.name} Unblock", binds, preparable: true).rows.first
+              with_slots_locked(connection, [ job.concurrency_key ]) { connection.select_all(<<~SQL.squish, "#{Job.name} Unblock", binds, preparable: true).rows.first }
                 WITH held AS (
                   #{hold_semaphore_sql(semaphore_id:, key:, now:)}
                 ), next AS (

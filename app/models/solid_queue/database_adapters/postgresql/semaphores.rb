@@ -9,6 +9,12 @@ module SolidQueue
       # overrides them. Arguments are SQL: binds, or expressions.
       module Semaphores
         private
+          # Runs the block, which takes or gives back slots of the keys' semaphores
+          # in its statement. The rows that statement locks are all it needs.
+          def with_slots_locked(connection, keys)
+            yield
+          end
+
           # A query that takes a slot of the key's semaphore, as Semaphore.wait
           # does, when condition holds. It returns the semaphore's id if it got
           # one, and no row if not.
