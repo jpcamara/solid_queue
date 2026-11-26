@@ -45,6 +45,12 @@ module SolidQueue
   mattr_accessor :clear_finished_jobs_after, default: 1.day
   mattr_accessor :default_concurrency_control_period, default: 3.minutes
 
+  # On PostgreSQL, the dispatcher seeks past the last scheduled job it
+  # dispatched instead of reading due jobs from the start every time, and
+  # reads them from the start every dispatch_cursors_full_pass_interval
+  mattr_accessor :dispatch_cursors, default: false
+  mattr_accessor :dispatch_cursors_full_pass_interval, default: 10.seconds
+
   # An adapter to run Solid Queue's operations instead of the one chosen for
   # the database, such as a subclass of DatabaseAdapters::Base
   mattr_accessor :database_adapter
