@@ -24,6 +24,7 @@ Solid Queue can be used with SQL databases such as MySQL, PostgreSQL, or SQLite,
   - [Database configuration](#database-configuration)
   - [Other configuration settings](#other-configuration-settings)
   - [Validating the configuration](#validating-the-configuration)
+- [Claim cursors on PostgreSQL](#claim-cursors-on-postgresql)
 - [Lifecycle hooks](#lifecycle-hooks)
 - [Errors when enqueuing](#errors-when-enqueuing)
 - [Concurrency controls](#concurrency-controls)
@@ -455,6 +456,9 @@ There are several settings that control how Solid Queue works that you can set a
 - `preserve_finished_jobs`: whether to keep finished jobs in the `solid_queue_jobs` table—defaults to `true`.
 - `clear_finished_jobs_after`: period to keep finished jobs around, in case `preserve_finished_jobs` is true — defaults to 1 day. When installing Solid Queue, [a recurring job](#recurring-tasks) is automatically configured to clear finished jobs every hour on the 12th minute in batches. You can edit the `recurring.yml` configuration to change this as you see fit.
 - `default_concurrency_control_period`: the value to be used as the default for the `duration` parameter in [concurrency controls](#concurrency-controls). It defaults to 3 minutes.
+- `claim_cursors`: whether to claim along [claim cursors](#claim-cursors-on-postgresql) on PostgreSQL—defaults to `false`. It has no effect on other databases.
+- `claim_cursors_discovery_interval`: how often each process runs a floored [discovery pass](#claim-cursors-on-postgresql) for each queue—defaults to 1 second.
+- `claim_cursors_full_discovery_interval`: how often each process runs a full [discovery pass](#claim-cursors-on-postgresql) for each queue—defaults to 10 seconds. `0` makes every discovery pass full.
 - `database_adapter`: an object that runs Solid Queue's database operations (enqueuing, making jobs ready, scheduling, claiming, finishing and releasing them) instead of the adapter Solid Queue picks for the database. It's meant for gems that keep jobs elsewhere, and should subclass `SolidQueue::DatabaseAdapters::Base`, overriding what they do differently. `nil` by default.
 
 ### Validating the configuration
@@ -473,6 +477,30 @@ Both commands validate the configuration for the current Rails environment. On s
 
 `bin/jobs check` accepts the same options as `bin/jobs start` (e.g. `--config_file`, `--recurring_schedule_file`, `--skip-recurring`). The rake task honors the same environment variables Solid Queue already uses: `SOLID_QUEUE_CONFIG`, `SOLID_QUEUE_RECURRING_SCHEDULE`, and `SOLID_QUEUE_SKIP_RECURRING`. To validate a specific environment's configuration, set `RAILS_ENV`, for example `RAILS_ENV=production bin/jobs check`.
 
+
+## Claim cursors on PostgreSQL
+
+A claim reads the polling index from its start, which is where claimed jobs leave their dead rows. Vacuum can't remove them while any older transaction is open, on the primary or, with `hot_standby_feedback`, on a replica, so every poll reads through more of them the longer that lasts.
+
+With `claim_cursors` on, each process remembers, for each queue, the `(priority, id)` position of the last job it claimed, and seeks past it in the index instead, across every priority. A seek that comes back empty keeps the position, so the next one finds new jobs, which get higher ids.
+
+A position isn't a lower bound for work: a claim below it can roll back, a row can get a lower id but commit after the position passed it, and a seek skips rows that other workers have locked at the time. So discovery passes that don't use the position run too:
+
+- A _floored_ pass every `claim_cursors_discovery_interval` (1 second). It looks only at rows above the _floor_, the highest id the process had seen before its last full pass, which every newly enqueued job is above. It reads up to 500 of them in `id` order, picks in `(priority, id)` order in memory, and claims its picks by id, so no plan reads the index from its start. It finds new work below the position, such as higher-priority jobs, and may set a missing position, but never moves one.
+- A _full_ pass every `claim_cursors_full_discovery_interval` (10 seconds, a little earlier for each process at random, so processes don't run it at once). It claims as without cursors, records the next floor, and is the only pass that reaches rows at or below the floor, and so the only one that moves the position anywhere.
+
+The dead rows are then read once per full interval instead of on every poll. In exchange, a row below the floor waits for the next full pass, and when more than 500 rows are above the floor, claims follow `(priority, id)` order only within those 500 until they're claimed or the next full pass. Within a priority, claims follow the order jobs became ready (`id`) instead of the order they were enqueued (`job_id`): a scheduled job coming due queues behind jobs of its priority already waiting.
+
+The seeks need indexes that end in `id`. To add them, concurrently, and turn cursors on:
+
+```bash
+bin/rails generate solid_queue:claim_cursors
+bin/rails db:migrate
+```
+
+```ruby
+config.solid_queue.claim_cursors = true
+```
 
 ## Lifecycle hooks
 

@@ -7,6 +7,7 @@ module SolidQueue
     class Postgresql < Base
       include Enqueuing, BulkEnqueuing, Claiming, Finishing, Releasing, Unblocking
       include Autocommit
+      include ClaimCursors
     end
   end
 end
