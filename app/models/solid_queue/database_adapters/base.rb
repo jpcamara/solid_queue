@@ -58,6 +58,14 @@ module SolidQueue
         yield
       end
 
+      # Deletes the batches that succeeded before finished_before,
+      # batch_size at a time, sleeping sleep_between_batches seconds after
+      # each batch, running the given block, which does it from the batches
+      # table.
+      def clear_finished_batches(batch_size:, finished_before:, sleep_between_batches:)
+        yield
+      end
+
       # Claims up to limit ready executions from the queues in queue_list, in
       # their order, for the process, skipping those locked elsewhere, and
       # returns the claims.

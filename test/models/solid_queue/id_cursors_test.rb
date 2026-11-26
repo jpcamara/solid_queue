@@ -17,6 +17,7 @@ class SolidQueue::IdCursorsTest < ActiveSupport::TestCase
     SolidQueue.dispatch_cursors_full_pass_interval = @full_pass_interval if @full_pass_interval
     @adapter&.reset_dispatch_cursors!
     SolidQueue::Process.destroy_all
+    SolidQueue::Batch.delete_all
   end
 
   test "finished jobs are cleared in batches that each start where the last one ended" do
@@ -51,6 +52,30 @@ class SolidQueue::IdCursorsTest < ActiveSupport::TestCase
 
     assert_not SolidQueue::Job.where(id: mine).exists?
     assert_equal others.sort, SolidQueue::Job.where(id: others).pluck(:id).sort
+  end
+
+  test "finished batches are cleared in batches that each start where the last one ended" do
+    old = insert_batches(5, finished_at: 2.days.ago)
+    failed = insert_batches(1, finished_at: 2.days.ago, failed_at: 2.days.ago)
+    recent = insert_batches(1, finished_at: 1.hour.ago)
+    unfinished = insert_batches(1, finished_at: nil)
+
+    statements = capturing_statements { assert_nil SolidQueue::Batch.clear_finished_in_batches(batch_size: 2) }
+    deletes = statements.grep(/\ADELETE/)
+
+    assert_equal (failed + recent + unfinished).sort, SolidQueue::Batch.where(id: old + failed + recent + unfinished).pluck(:id).sort
+    assert_equal 4, deletes.size, deletes
+    assert_no_match(/finished_at" >=/, deletes.first)
+    assert deletes.drop(1).all? { |sql| sql.include?(%("solid_queue_batches"."finished_at" >= )) }, deletes
+  end
+
+  test "batches that finished at the same time as the last one cleared are cleared next, with the sleeps as before" do
+    batches = insert_batches(5, finished_at: 2.days.ago.round(6))
+    @adapter.expects(:sleep).with(0.01).times(4)
+
+    SolidQueue::Batch.clear_finished_in_batches(batch_size: 2, sleep_between_batches: 0.01)
+
+    assert_not SolidQueue::Batch.where(id: batches).exists?
   end
 
   test "the dispatcher reads from the start first, then seeks past the last job it selected" do
@@ -132,6 +157,13 @@ class SolidQueue::IdCursorsTest < ActiveSupport::TestCase
           finished_at: finished_at, scheduled_at: Time.current, created_at: Time.current, updated_at: Time.current }
       end
       SolidQueue::Job.insert_all!(rows, returning: :id).rows.flatten
+    end
+
+    def insert_batches(count, finished_at:, failed_at: nil)
+      rows = count.times.map do
+        { active_job_batch_id: SecureRandom.uuid, finished_at: finished_at, failed_at: failed_at, created_at: Time.current, updated_at: Time.current }
+      end
+      SolidQueue::Batch.insert_all!(rows, returning: :id).rows.flatten
     end
 
     def schedule(count, wait: 1.minute)
