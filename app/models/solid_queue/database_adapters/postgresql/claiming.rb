@@ -17,11 +17,7 @@ module SolidQueue
 
             ReadyExecution.claim_from_each_queue(queue_list, limit) do |queue_relation, remaining|
               claim_in_one_statement(connection, queue_relation, process_id, remaining).tap do |claimed|
-                # As Base, only when there was something to claim
-                if claimed.any?
-                  job_ids = claimed.map(&:job_id)
-                  SolidQueue.instrument(:claim, process_id: process_id, job_ids: job_ids, size: claimed.size, claimed_job_ids: job_ids)
-                end
+                instrument_claim(process_id, claimed)
               end
             end
           end
@@ -33,17 +29,31 @@ module SolidQueue
             # there's a prepared statement per queue and limit
             candidates = queue_relation.ordered.limit(limit).non_blocking_lock.select(:id, :job_id).to_sql
 
+            run_claim(connection, "WITH candidates AS (#{candidates}), #{claim_sql}", [ process_id ]).map { |row| claim_from(row) }
+          end
+
+          # Runs a claim statement and returns its rows
+          def run_claim(connection, sql, binds)
             # As the statements it replaces would
             ActiveRecord::Base.clear_query_caches_for_current_thread if connection.pool.dirties_query_cache
 
             # Prepared, which Active Record only does for a string when told it can
-            result = connection.select_all("WITH candidates AS (#{candidates}), #{claim_sql}", "SolidQueue::ReadyExecution Claim", [ process_id ], preparable: true)
+            connection.select_all(sql, "SolidQueue::ReadyExecution Claim", binds, preparable: true).to_a
+          end
 
-            result.to_a.map do |row|
-              claim = ClaimedExecution.instantiate("id" => row.delete("claimed_id"), "job_id" => row["id"],
-                "process_id" => row.delete("claimed_process_id"), "created_at" => row.delete("claimed_created_at"))
-              claim.association(:job).target = Job.instantiate(row)
-              claim
+          # The claim in a row of the statement, with its job loaded
+          def claim_from(row)
+            claim = ClaimedExecution.instantiate("id" => row.delete("claimed_id"), "job_id" => row["id"],
+              "process_id" => row.delete("claimed_process_id"), "created_at" => row.delete("claimed_created_at"))
+            claim.association(:job).target = Job.instantiate(row)
+            claim
+          end
+
+          # As Base, only when there was something to claim
+          def instrument_claim(process_id, claimed)
+            if claimed.any?
+              job_ids = claimed.map(&:job_id)
+              SolidQueue.instrument(:claim, process_id: process_id, job_ids: job_ids, size: claimed.size, claimed_job_ids: job_ids)
             end
           end
 

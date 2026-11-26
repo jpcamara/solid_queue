@@ -59,6 +59,8 @@ class ActiveSupport::TestCase
   end
 
   setup do
+    # Claim cursors are kept by the process, and mustn't outlive the rows they came from
+    SolidQueue::DatabaseAdapters::Postgresql::ClaimCursors.reset!
     @_on_thread_error = SolidQueue.on_thread_error
     SolidQueue.on_thread_error = silent_on_thread_error_for(ExpectedTestError, @_on_thread_error)
     ActiveJob::QueueAdapters::SolidQueueAdapter.stopping = false

@@ -60,6 +60,12 @@ Rails.application.configure do
 
   config.solid_queue.shutdown_timeout = 2.seconds
 
+  # When claim cursors are on: quick pickup for integration tests, and a full
+  # pass often enough that what only it can find is found within a test's
+  # wait. ClaimCursorsTest sets its own.
+  config.solid_queue.claim_cursors_discovery_interval = 0.05.seconds
+  config.solid_queue.claim_cursors_full_discovery_interval = 1.second
+
   config.log_formatter = proc do |severity, timestamp, progname, msg|
     ts = timestamp.getlocal.strftime("%H:%M:%S.%3N")
     "#{ts} #{msg}\n"

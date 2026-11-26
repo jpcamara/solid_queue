@@ -18,6 +18,18 @@ module SolidQueue
       end
     end
 
+    # The relations by queue name, or :all for the one of every queue: a
+    # symbol, so a queue named "*" can't be taken for it. Empty when there's
+    # no queue to read from.
+    def relations_by_queue
+      case
+      when all?  then { all: relation.all }
+      when none? then {}
+      else
+        queue_names.index_with { |queue_name| relation.queued_as(queue_name) }
+      end
+    end
+
     private
       def all?
         include_all_queues? && paused_queues.empty?

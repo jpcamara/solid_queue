@@ -13,12 +13,13 @@ module SolidQueue
 
       # Yields each queue's relation from queue_list, in order, with how many
       # are left to claim of limit, given what the block returned for the
-      # queues before, and returns all it returned.
+      # queues before, and the queue's name, or :all for every queue, and
+      # returns all it returned.
       def claim_from_each_queue(queue_list, limit)
-        QueueSelector.new(queue_list, self).scoped_relations.flat_map do |queue_relation|
+        QueueSelector.new(queue_list, self).relations_by_queue.flat_map do |key, queue_relation|
           next [] if limit <= 0
 
-          yield(queue_relation, limit).tap do |locked|
+          yield(queue_relation, limit, key).tap do |locked|
             limit -= locked.size
           end
         end
