@@ -24,6 +24,13 @@ class SolidQueue::JobReadyOnInsertTest < ActiveSupport::TestCase
     end
   end
 
+  class CappedJob < ApplicationJob
+    limits_concurrency key: ->(value) { value }, max_blocked: 1
+
+    def perform(value)
+    end
+  end
+
   setup do
     skip "Needs Active Record 8 or later" if ActiveRecord.version < Gem::Version.new("8.0")
 
@@ -174,6 +181,113 @@ class SolidQueue::JobReadyOnInsertTest < ActiveSupport::TestCase
 
     assert_equal 2, jobs.count(&:ready?)
     assert_equal threads - 2, jobs.count(&:blocked?)
+    assert_equal 0, SolidQueue::Semaphore.sole.value
+  end
+
+  test "a capped job that gets a slot, or is blocked, is inserted by one statement after its key is locked" do
+    ready, blocked = nil, nil
+    statements = [ capturing_statements { ready = CappedJob.perform_later("key") }, capturing_statements { blocked = CappedJob.perform_later("key") } ]
+
+    assert SolidQueue::Job.find(ready.provider_job_id).ready?
+    assert SolidQueue::Job.find(blocked.provider_job_id).blocked?
+    assert_equal 0, SolidQueue::Semaphore.sole.value
+    if postgresql?
+      # The check for a full key, then the lock, which creates the semaphore if there's none
+      statements.each { |enqueue| assert_equal [ "SELECT", "BEGIN", "INSERT", "WITH", "COMMIT" ], verbs(enqueue), enqueue }
+      assert_match(/INSERT INTO "solid_queue_semaphores".*WHERE false/, statements.first.third)
+    end
+  end
+
+  test "a capped job over max_blocked isn't inserted" do
+    2.times { CappedJob.perform_later("key") }
+
+    single, set = CappedJob.new("key"), [ CappedJob.new("key"), CappedJob.new("key") ]
+    statements = capturing_statements do
+      single.enqueue
+      ActiveJob.perform_all_later(set)
+    end
+
+    assert single.successfully_enqueued?
+    assert_nil single.provider_job_id
+    assert_equal [ nil, nil ], set.map(&:successfully_enqueued?)
+    assert_equal 2, SolidQueue::Job.count
+    # Only the checks for a full key, one for the set
+    assert_equal [ "SELECT" ] * 2, verbs(statements) - [ "BEGIN", "COMMIT" ], statements
+  end
+
+  test "capped jobs enqueued together are blocked up to max_blocked, and the rest aren't inserted" do
+    set = 4.times.map { CappedJob.new("key") }
+    statements = capturing_statements { ActiveJob.perform_all_later(set) }
+
+    assert_equal [ true, true, nil, nil ], set.map(&:successfully_enqueued?)
+    jobs = SolidQueue::Job.find(set.first(2).map(&:provider_job_id))
+    assert jobs.first.ready?
+    assert jobs.second.blocked?
+    assert_equal 2, SolidQueue::Job.count
+    assert_empty statements.grep(/\ADELETE/), statements if postgresql?
+  end
+
+  test "a capped job discarded on enqueue is counted into its batch, which mustn't have finished" do
+    2.times { CappedJob.perform_later("key") }
+
+    batch = SolidQueue::Batch.enqueue do
+      CappedJob.perform_later("key")
+      ActiveJob.perform_all_later([ CappedJob.new("key") ])
+    end
+    assert_equal 2, batch.reload.total_jobs
+    assert_equal 2, SolidQueue::Job.count
+
+    SolidQueue::Batch.where(id: batch.id).update_all(finished_at: Time.current)
+    assert_raises(SolidQueue::Batch::AlreadyFinished) { CappedJob.new("key").tap { |job| job.batch_id = batch.id }.enqueue }
+    assert_raises(SolidQueue::Batch::AlreadyFinished) { ActiveJob.perform_all_later([ CappedJob.new("key").tap { |job| job.batch_id = batch.id } ]) }
+  end
+
+  test "a capped job finding max_blocked jobs blocked once its key is locked isn't inserted" do
+    2.times { CappedJob.perform_later("key") }
+    # As if they were blocked after the check for a full key, and before the lock
+    adapter = SolidQueue::Job.database_adapter
+    adapter.stubs(:full_with_blocked?).returns(false)
+
+    job, created = CappedJob.new("key"), nil
+    statements = capturing_statements do
+      job.enqueue
+      created = SolidQueue::Job.enqueue(CappedJob.new("key"))
+    end
+
+    assert job.successfully_enqueued?
+    assert_nil job.provider_job_id
+    assert_not created.persisted?
+    assert_equal 2, SolidQueue::Job.count
+    assert_equal 0, SolidQueue::Semaphore.sole.value
+    assert_equal [ "BEGIN", "INSERT", "WITH", "COMMIT" ], verbs(statements).first(4), statements if postgresql?
+
+    # A set taking its slots together
+    set = [ CappedJob.new("key"), LimitedJob.new("other") ]
+    assert_difference -> { SolidQueue::Job.count }, +1 do
+      ActiveJob.perform_all_later(set)
+    end
+    assert_equal [ nil, true ], set.map(&:successfully_enqueued?)
+  ensure
+    adapter&.unstub(:full_with_blocked?)
+  end
+
+  test "capped jobs enqueued at once, alone and together, on a new key keep max_blocked" do
+    skip unless postgresql? # Elsewhere they can deadlock creating the semaphore
+
+    threads, start = 12, Queue.new
+    enqueuers = threads.times.map do |thread|
+      Thread.new do
+        SolidQueue::Record.connection_pool.with_connection do
+          start.pop
+          thread.even? ? 10.times { CappedJob.perform_later("key") } : 4.times { ActiveJob.perform_all_later(3.times.map { CappedJob.new("key") }) }
+        end
+      end
+    end
+    threads.times { start << true }
+    enqueuers.each(&:join)
+
+    assert_equal [ 1, 1 ], [ SolidQueue::ReadyExecution.count, SolidQueue::BlockedExecution.count ]
+    assert_equal 2, SolidQueue::Job.count
     assert_equal 0, SolidQueue::Semaphore.sole.value
   end
 

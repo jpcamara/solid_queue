@@ -84,6 +84,13 @@ module SolidQueue
         blocked_execution.present?
       end
 
+      # Whether the job, not inserted yet, would be discarded once inserted,
+      # being due on a key with no slot free and max_blocked jobs blocked on
+      # it. It's then discarded without being inserted.
+      def discardable_on_enqueue?
+        due? && blocked_queue_full?
+      end
+
       def job_class
         @job_class ||= class_name.safe_constantize
       end

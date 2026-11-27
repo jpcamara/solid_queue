@@ -267,8 +267,36 @@ class SolidQueue::SemaphoreLogTest < ActiveSupport::TestCase
     end
   end
 
+  test "a capped job is inserted, ready or blocked, by one statement after its key is locked" do
+    statements = 2.times.map { capturing_statements { CappedJob.perform_later("a") } }
+
+    statements.each { |enqueue| assert_equal [ "SELECT", "SELECT", "WITH" ], verbs(enqueue), enqueue }
+    assert_match(/pg_advisory_xact_lock/, statements.first.second)
+    assert_equal [ 0 ], log("semaphore log capped/a").map { |row| row["value"] }
+  end
+
+  test "a capped job finding max_blocked jobs blocked once its key is locked isn't inserted" do
+    2.times { enqueue(CappedJob, "a") }
+    adapter = SolidQueue::Job.database_adapter
+    adapter.stubs(:full_with_blocked?).returns(false)
+
+    statements = capturing_statements { CappedJob.perform_later("a") }
+
+    assert_equal [ "SELECT", "WITH" ], verbs(statements), statements
+    assert_equal 2, SolidQueue::Job.count
+    assert_equal [ 0 ], log("semaphore log capped/a").map { |row| row["value"] }
+  ensure
+    adapter&.unstub(:full_with_blocked?)
+  end
+
   test "concurrent enqueues on a max_blocked key keep its cap" do
-    16.times.map { Thread.new { SolidQueue::Record.connection_pool.with_connection { 25.times { CappedJob.perform_later("k") } } } }.each(&:join)
+    16.times.map do |thread|
+      Thread.new do
+        SolidQueue::Record.connection_pool.with_connection do
+          thread.even? ? 25.times { CappedJob.perform_later("k") } : 5.times { ActiveJob.perform_all_later(5.times.map { CappedJob.new("k") }) }
+        end
+      end
+    end.each(&:join)
 
     jobs = SolidQueue::Job.where(concurrency_key: "semaphore log capped/k")
     assert_equal 2, jobs.count

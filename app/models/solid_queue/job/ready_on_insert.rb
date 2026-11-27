@@ -10,6 +10,9 @@ module SolidQueue
     module ReadyOnInsert
       extend ActiveSupport::Concern
 
+      # Raised by an adapter that discarded the job instead of inserting it
+      class Discarded < StandardError; end
+
       class_methods do
         # The INSERT of a record being created. Active Record 7.2 and later
         # pass it the connection.
@@ -51,6 +54,10 @@ module SolidQueue
           state = ActiveSupport::IsolatedExecutionState
           outer, state[:solid_queue_job_being_created] = state[:solid_queue_job_being_created], self
           super
+        rescue Discarded
+          # As if it had been inserted, and destroyed by dispatching
+          @new_record, @previously_new_record, @destroyed = false, true, true
+          nil
         ensure
           state[:solid_queue_job_being_created] = outer
           @made_ready_on_insert = false
