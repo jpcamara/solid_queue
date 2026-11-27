@@ -57,6 +57,23 @@ module SolidQueue
           end
         end
 
+        def lock_concurrency_key(key)
+          Semaphore.with_connection { |connection| with_slots_locked(connection, [ key ]) { } }
+        end
+
+        def full_with_blocked?(key, count)
+          Semaphore.with_connection do |connection|
+            binds, bind = binder
+            key, offset = bind.(key, :key), bind.(count - 1, :value)
+            connection.select_value(<<~SQL.squish, "#{Semaphore.name} Full", binds).present?
+              SELECT 1 FROM #{current_semaphore_sql(key, bind.(Time.current, :created_at))} current
+              WHERE current.value <= 0 AND (#{offset} < 0 OR EXISTS (
+                SELECT 1 FROM #{BlockedExecution.quoted_table_name} WHERE concurrency_key = #{key} LIMIT 1 OFFSET GREATEST(#{offset}, 0)
+              ))
+            SQL
+          end
+        end
+
         # Deletes the rows no lookup reads any more: those a newer row of their
         # key replaced, and those that have expired. Each batch starts after
         # the last one; the first still reads through what earlier runs deleted

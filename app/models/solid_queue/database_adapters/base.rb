@@ -49,6 +49,24 @@ module SolidQueue
         (keys - semaphores.keys) | semaphores.select { |_key, value| value > 0 }.keys
       end
 
+      # Locks the concurrency key until the transaction ends, so callers on it
+      # take turns.
+      def lock_concurrency_key(key)
+        Semaphore.lock.find_by(key: key)
+      end
+
+      # Whether the concurrency key has no slot free and at least count jobs
+      # blocked on it. Both are read in one statement, without locking, so
+      # they come from the same moment.
+      def full_with_blocked?(key, count)
+        full = Semaphore.where(key: key, value: ..0)
+        if count.positive?
+          count_th = BlockedExecution.where(concurrency_key: key).offset(count - 1).limit(1).select(1)
+          full = full.where(count_th.arel.exists)
+        end
+        full.exists?
+      end
+
       # Run by the dispatcher's concurrency maintenance: deletes the
       # semaphores that have expired, batch_size at a time.
       def expire_semaphores(batch_size)
