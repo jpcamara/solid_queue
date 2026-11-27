@@ -19,6 +19,14 @@ module SolidQueue
         Job.create_all_and_prepare_for_execution(active_jobs)
       end
 
+      # Makes inserted jobs with concurrency limits that are due ready, or
+      # blocks or discards them, taking their slots, in the transaction it's
+      # called in. The given block does it for the jobs it's given, one at a
+      # time.
+      def dispatch_limited(jobs)
+        yield jobs
+      end
+
       # Releases a blocked execution if its job gets a concurrency slot,
       # making the job ready, and fails a job whose class doesn't load.
       def release(blocked_execution)
