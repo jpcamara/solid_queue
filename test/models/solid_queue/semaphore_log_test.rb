@@ -51,6 +51,7 @@ class SolidQueue::SemaphoreLogTest < ActiveSupport::TestCase
   teardown do
     SolidQueue.database_adapter = nil
     SolidQueue::Process.destroy_all
+    SolidQueue::Batch.destroy_all
   end
 
   test "limited jobs take their slots from the log, and the semaphores table isn't used" do
