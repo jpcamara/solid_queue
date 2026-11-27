@@ -49,7 +49,7 @@ module SolidQueue
     private
       def expire_semaphores
         wrap_in_app_executor do
-          Semaphore.expired.in_batches(of: batch_size, &:delete_all)
+          Semaphore.database_adapter.expire_semaphores(batch_size)
         end
       end
 

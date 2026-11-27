@@ -6,6 +6,7 @@ module SolidQueue
     # its own way is in a module of its own.
     class Postgresql < Base
       include Enqueuing, BulkEnqueuing, Claiming, Finishing, Releasing, Unblocking
+      include Semaphores
       include Autocommit
     end
   end

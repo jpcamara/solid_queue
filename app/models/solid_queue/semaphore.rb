@@ -7,11 +7,11 @@ module SolidQueue
 
     class << self
       def wait(job)
-        Proxy.new(job).wait
+        database_adapter.take_slot(job)
       end
 
       def signal(job)
-        Proxy.new(job).signal
+        database_adapter.give_back_slot(job)
       end
 
       # Requires a unique index on key
