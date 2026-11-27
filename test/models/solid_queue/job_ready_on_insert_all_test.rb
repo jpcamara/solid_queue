@@ -120,8 +120,21 @@ class SolidQueue::JobReadyOnInsertAllTest < ActiveSupport::TestCase
     assert_equal 1, SolidQueue::Semaphore.sole.value
   end
 
-  test "a set with a job that discards on conflict, or with different limits or durations on one key, is dispatched one at a time" do
-    [ [ DiscardingJob.new("x"), LimitedToTwoJob.new("a") ], [ LimitedToTwoJob.new("b"), LimitedToThreeJob.new("b") ], [ LimitedToTwoJob.new("c"), LimitedToTwoForLongerJob.new("c") ] ].each do |jobs|
+  test "jobs that discard on conflict take their slots with the set, and those without one aren't inserted" do
+    jobs = [ DiscardingJob.new("x"), DiscardingJob.new("x"), LimitedToTwoJob.new("a") ]
+    statements = capturing_statements { ActiveJob.perform_all_later(jobs) }
+
+    assert_equal [ true, nil, true ], jobs.map(&:successfully_enqueued?)
+    took, discarded, limited = find(jobs)
+    assert took.ready?
+    assert_nil discarded
+    assert limited.ready?
+    assert_not_nil took.acquired_semaphore_id
+    assert_no_match(/SAVEPOINT|DELETE/, statements.join("\n")) if postgresql?
+  end
+
+  test "a set with different limits or durations on one key is dispatched one at a time" do
+    [ [ LimitedToTwoJob.new("b"), LimitedToThreeJob.new("b") ], [ LimitedToTwoJob.new("c"), LimitedToTwoForLongerJob.new("c") ] ].each do |jobs|
       statements = capturing_statements { ActiveJob.perform_all_later(jobs) }
 
       assert find(jobs).all?(&:ready?)
@@ -162,7 +175,7 @@ class SolidQueue::JobReadyOnInsertAllTest < ActiveSupport::TestCase
     assert_empty SolidQueue::Job.all
   end
 
-  test "the same job twice, or a limit below 1, is dispatched one at a time" do
+  test "the same job twice is inserted and then dispatched, and a limit below 1 is dispatched one at a time" do
     job = LimitedToOneJob.new("a")
     zero = LimitedToZeroJob.new("z")
 
@@ -172,7 +185,13 @@ class SolidQueue::JobReadyOnInsertAllTest < ActiveSupport::TestCase
       first, second = SolidQueue::Job.where(concurrency_key: jobs.first.concurrency_key).order(:id).to_a
       assert first.ready?
       assert second.blocked?
-      assert_no_match(/json_to_recordset/, statements.join("\n"))
+      inserted = statements.index { |sql| sql.start_with?('INSERT INTO "solid_queue_jobs"') }
+      if jobs.first == jobs.last && postgresql?
+        assert_match(/json_to_recordset/, statements.drop(inserted).join("\n"))
+        assert_no_match(/json_to_recordset/, statements.take(inserted).join("\n"))
+      else
+        assert_no_match(/json_to_recordset/, statements.join("\n"))
+      end
     end
   end
 
