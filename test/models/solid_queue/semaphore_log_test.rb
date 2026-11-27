@@ -38,6 +38,13 @@ class SolidQueue::SemaphoreLogTest < ActiveSupport::TestCase
     end
   end
 
+  class DiscardingJob < ApplicationJob
+    limits_concurrency key: ->(value) { value }, group: "semaphore log discarding", on_conflict: :discard, duration: 3.minutes
+
+    def perform(value)
+    end
+  end
+
   LOG = "solid_queue_semaphore_log"
 
   setup do
@@ -287,6 +294,15 @@ class SolidQueue::SemaphoreLogTest < ActiveSupport::TestCase
     assert_equal [ 0 ], log("semaphore log capped/a").map { |row| row["value"] }
   ensure
     adapter&.unstub(:full_with_blocked?)
+  end
+
+  test "a job that discards on conflict is inserted by one statement after its key is locked, and isn't without a slot" do
+    statements = 2.times.map { capturing_statements { DiscardingJob.perform_later("a") } }
+
+    statements.each { |enqueue| assert_equal [ "SELECT", "WITH" ], verbs(enqueue), enqueue }
+    assert_equal 1, SolidQueue::Job.count
+    assert SolidQueue::Job.sole.ready?
+    assert_equal [ 0 ], log("semaphore log discarding/a").map { |row| row["value"] }
   end
 
   test "concurrent enqueues on a max_blocked key keep its cap" do
