@@ -87,9 +87,12 @@ module SolidQueue
             return yield if keys.empty?
 
             connection.transaction do
+              # The locks are taken in a subquery, so their void results aren't returned
               isolation = connection.select_values(<<~SQL.squish, "#{Semaphore.name} Lock", [ json_bind(keys.uniq) ]).first
-                SELECT current_setting('transaction_isolation'), pg_advisory_xact_lock(hashtextextended('#{LOG}/' || key, 0))
-                FROM json_array_elements_text($1::json) AS keys(key) ORDER BY key COLLATE "C"
+                SELECT current_setting('transaction_isolation') FROM (
+                  SELECT pg_advisory_xact_lock(hashtextextended('#{LOG}/' || key, 0))
+                  FROM json_array_elements_text($1::json) AS keys(key) ORDER BY key COLLATE "C"
+                ) locks
               SQL
               unless isolation == "read committed"
                 raise ActiveRecord::TransactionIsolationError, "Solid Queue's semaphore log needs READ COMMITTED, not #{isolation.upcase}"
