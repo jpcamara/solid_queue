@@ -22,6 +22,10 @@ class SolidQueue::JobTest < ActiveSupport::TestCase
     limits_concurrency to: 2, key: ->(job_result, **) { job_result }, on_conflict: :block, max_blocked: 2
   end
 
+  class BoundedBlockedOddKeyJob < NonOverlappingJob
+    limits_concurrency key: ->(job_result, **) { "?key :name #{job_result.id}" }, on_conflict: :block, max_blocked: 1
+  end
+
   class DiscardableWithMaxBlockedJob < NonOverlappingJob
     limits_concurrency key: ->(job_result, **) { job_result }, on_conflict: :discard, max_blocked: 5
   end
@@ -180,6 +184,41 @@ class SolidQueue::JobTest < ActiveSupport::TestCase
     assert_job_counts do
       BoundedBlockedJob.perform_later(@result, name: "discarded-1")
       BoundedBlockedJob.perform_later(@result, name: "discarded-2")
+    end
+  end
+
+  test "discard jobs over max_blocked without taking a slot or locking the key" do
+    BoundedBlockedJob.perform_later(@result, name: "ready")
+    BoundedBlockedJob.perform_later(@result, name: "blocked")
+
+    adapter = SolidQueue::Job.database_adapter
+    adapter.stubs(:take_slot).raises("took a slot")
+    adapter.stubs(:lock_concurrency_key).raises("locked the key")
+    assert_job_counts do
+      BoundedBlockedJob.perform_later(@result, name: "discarded")
+    end
+  ensure
+    adapter&.unstub(:take_slot)
+    adapter&.unstub(:lock_concurrency_key)
+  end
+
+  test "max_blocked works with keys that look like SQL placeholders" do
+    assert_ready { BoundedBlockedOddKeyJob.perform_later(@result, name: "ready") }
+    assert_blocked { BoundedBlockedOddKeyJob.perform_later(@result, name: "blocked") }
+    assert_job_counts { BoundedBlockedOddKeyJob.perform_later(@result, name: "discarded") }
+  end
+
+  test "a job over max_blocked takes a slot that's free" do
+    BoundedBlockedJob.perform_later(@result, name: "ready")
+    BoundedBlockedJob.perform_later(@result, name: "blocked")
+
+    # The semaphore expires and maintenance deletes it, freeing the slot while the blocked job is still waiting
+    travel 1.day do
+      SolidQueue::Job.database_adapter.expire_semaphores(100)
+
+      assert_ready do
+        BoundedBlockedJob.perform_later(@result, name: "takes the free slot")
+      end
     end
   end
 

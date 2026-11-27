@@ -31,6 +31,13 @@ class SolidQueue::SemaphoreLogTest < ActiveSupport::TestCase
     end
   end
 
+  class CappedJob < ApplicationJob
+    limits_concurrency key: ->(value) { value }, group: "semaphore log capped", max_blocked: 1, duration: 3.minutes
+
+    def perform(value)
+    end
+  end
+
   LOG = "solid_queue_semaphore_log"
 
   setup do
@@ -237,6 +244,36 @@ class SolidQueue::SemaphoreLogTest < ActiveSupport::TestCase
     ready.map { |job| Thread.new { SolidQueue::Record.connection_pool.with_connection { job.unblock_next_blocked_job } } }.each(&:join)
     assert_equal 6, jobs.reload.count(&:ready?)
     assert_equal 0, log(key).last["value"]
+  end
+
+  test "a job over max_blocked is discarded without locking its key" do
+    2.times { enqueue(CappedJob, "a") }
+
+    statements = capturing_statements do
+      assert_no_difference -> { SolidQueue::Job.count } do
+        CappedJob.perform_later("a")
+      end
+    end
+
+    assert_empty statements.grep(/pg_advisory_xact_lock/), statements
+    assert_equal [ 0 ], log("semaphore log capped/a").map { |row| row["value"] }
+  end
+
+  test "a job over max_blocked takes the slot of a semaphore that expired" do
+    2.times { enqueue(CappedJob, "a") }
+
+    travel 4.minutes do
+      assert enqueue(CappedJob, "a").ready?
+    end
+  end
+
+  test "concurrent enqueues on a max_blocked key keep its cap" do
+    16.times.map { Thread.new { SolidQueue::Record.connection_pool.with_connection { 25.times { CappedJob.perform_later("k") } } } }.each(&:join)
+
+    jobs = SolidQueue::Job.where(concurrency_key: "semaphore log capped/k")
+    assert_equal 2, jobs.count
+    assert_equal 1, jobs.count(&:ready?)
+    assert_equal 1, jobs.count(&:blocked?)
   end
 
   test "maintenance deletes the rows newer ones replaced and the expired ones, in batches, keeping each key's semaphore" do

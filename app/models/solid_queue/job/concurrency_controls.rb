@@ -116,6 +116,16 @@ module SolidQueue
           arguments[CONCURRENCY_LOCK_KEY]
         end
 
+        # Whether this job would be discarded because its key has no free slot
+        # and already has max_blocked jobs waiting. Checked before taking the
+        # key's lock, so enqueues on a busy key don't wait their turn for the
+        # lock only to be discarded. Not locking is safe: a blocked job seen
+        # here hasn't started, so it runs after this enqueue.
+        def blocked_queue_full?
+          concurrency_limited? && concurrency_max_blocked.present? && !concurrency_on_conflict.discard? &&
+            self.class.database_adapter.full_with_blocked?(concurrency_key, concurrency_max_blocked)
+        end
+
         def handle_concurrency_conflict
           if concurrency_on_conflict.discard?
             destroy
@@ -128,8 +138,8 @@ module SolidQueue
           return BlockedExecution.create_or_find_by!(job: self) unless concurrency_max_blocked
 
           transaction do
-            # Lock the semaphore row to serialize concurrent enqueues racing to fill the cap.
-            Semaphore.lock.find_by(key: concurrency_key)
+            # Lock the key to serialize concurrent enqueues racing to fill the cap.
+            self.class.database_adapter.lock_concurrency_key(concurrency_key)
 
             if BlockedExecution.where(concurrency_key: concurrency_key).count < concurrency_max_blocked
               BlockedExecution.create_or_find_by!(job: self)
