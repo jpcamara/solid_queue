@@ -13,12 +13,19 @@ module SolidQueue
 
     class << self
       def create_all_from_jobs(jobs)
+        # Update the counters first: inserting tracking rows takes a shared FK lock on
+        # the batch row, then incrementing can deadlock concurrent MySQL adders.
+        count_into_batches(jobs)
+
+        batched = jobs.select(&:batched?)
+        super batched if batched.any?
+      end
+
+      # Counts the jobs into their batches, without tracking them, as for jobs
+      # discarded on enqueue. Raises if a batch has finished.
+      def count_into_batches(jobs)
         jobs.select(&:batched?).group_by(&:batch_id).each do |batch_id, jobs_in_batch|
-          # Update the counter first: inserting tracking rows takes a shared FK lock on
-          # the batch row, then incrementing can deadlock concurrent MySQL adders.
-          if attempt_to_update_total_jobs(batch_id, jobs_in_batch)
-            super jobs_in_batch
-          else
+          unless attempt_to_update_total_jobs(batch_id, jobs_in_batch)
             raise Batch::AlreadyFinished, "Can't add jobs into an already finished batch"
           end
         end

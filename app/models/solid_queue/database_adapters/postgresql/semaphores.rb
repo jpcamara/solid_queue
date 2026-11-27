@@ -17,6 +17,16 @@ module SolidQueue
             yield
           end
 
+          # Locks the job's semaphore, after its batch, in statements of their
+          # own, for a statement that counts the jobs blocked on its key: starting
+          # after the lock, it counts what the last holder committed. A semaphore
+          # that doesn't exist yet is created with every slot free, so there's a
+          # row to lock.
+          def lock_semaphore_first(connection, job)
+            lock_batches(connection, [ job ])
+            create_semaphores(connection, [ { key: job.concurrency_key, value: job.concurrency_limit, expires_at: connection.quoted_date(job.concurrency_duration.from_now) } ], Time.current)
+          end
+
           # A query that takes a slot of the key's semaphore, as Semaphore.wait
           # does, when condition holds. It returns the semaphore's id if it got
           # one, and no row if not.

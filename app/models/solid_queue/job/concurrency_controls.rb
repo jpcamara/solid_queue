@@ -61,6 +61,11 @@ module SolidQueue
         job_class ? job_class.concurrency_duration : SolidQueue.default_concurrency_control_period
       end
 
+      # The most jobs that can wait blocked on the job's key, or nil for no cap
+      def concurrency_max_blocked
+        job_class&.concurrency_max_blocked
+      end
+
       # The semaphore the job got its concurrency slot from
       def acquired_semaphore_id
         concurrency_lock&.dig("semaphore_id")
@@ -77,6 +82,13 @@ module SolidQueue
 
       def blocked?
         blocked_execution.present?
+      end
+
+      # Whether the job, not inserted yet, would be discarded once inserted,
+      # being due on a key with no slot free and max_blocked jobs blocked on
+      # it. It's then discarded without being inserted.
+      def discardable_on_enqueue?
+        due? && blocked_queue_full?
       end
 
       def job_class
@@ -111,6 +123,16 @@ module SolidQueue
           arguments[CONCURRENCY_LOCK_KEY]
         end
 
+        # Whether this job would be discarded because its key has no free slot
+        # and already has max_blocked jobs waiting. Checked before taking the
+        # key's lock, so enqueues on a busy key don't wait their turn for the
+        # lock only to be discarded. Not locking is safe: a blocked job seen
+        # here hasn't started, so it runs after this enqueue.
+        def blocked_queue_full?
+          concurrency_limited? && concurrency_max_blocked.present? && !concurrency_on_conflict.discard? &&
+            self.class.database_adapter.full_with_blocked?(concurrency_key, concurrency_max_blocked)
+        end
+
         def handle_concurrency_conflict
           if concurrency_on_conflict.discard?
             destroy
@@ -120,7 +142,18 @@ module SolidQueue
         end
 
         def block
-          BlockedExecution.create_or_find_by!(job: self)
+          return BlockedExecution.create_or_find_by!(job: self) unless concurrency_max_blocked
+
+          transaction do
+            # Lock the key to serialize concurrent enqueues racing to fill the cap.
+            self.class.database_adapter.lock_concurrency_key(concurrency_key)
+
+            if BlockedExecution.where(concurrency_key: concurrency_key).count < concurrency_max_blocked
+              BlockedExecution.create_or_find_by!(job: self)
+            else
+              destroy
+            end
+          end
         end
 
         def execution
