@@ -54,7 +54,7 @@ module SolidQueue
                 binds << ActiveRecord::Relation::QueryAttribute.new(attribute.to_s, value, model.type_for_attribute(attribute))
                 "CAST($#{binds.size} AS #{model.columns_hash[attribute.to_s].sql_type})"
               end
-              job, semaphores = blocked_execution.job, Semaphore.quoted_table_name
+              job = blocked_execution.job
               limit, now = bind.(job.concurrency_limit, Semaphore, :value), bind.(Time.current, Semaphore, :created_at)
               expires_at, key = bind.(job.concurrency_duration.from_now, Semaphore, :expires_at), bind.(job.concurrency_key, Semaphore, :key)
               released_job, id = bind.(job.id, Job, :id), bind.(blocked_execution.id, BlockedExecution, :id)
@@ -64,13 +64,9 @@ module SolidQueue
               ActiveRecord::Base.clear_query_caches_for_current_thread if connection.pool.dirties_query_cache
 
               # Prepared, which Active Record only does for a string when told it can
-              connection.select_all(<<~SQL.squish, "#{BlockedExecution.name} Release", binds, preparable: true).rows.dig(0, 0)
+              with_slots_locked(connection, [ job.concurrency_key ]) { connection.select_all(<<~SQL.squish, "#{BlockedExecution.name} Release", binds, preparable: true).rows.dig(0, 0) }
                 WITH semaphore AS (
-                  INSERT INTO #{semaphores} (key, value, expires_at, created_at, updated_at)
-                  VALUES (#{key}, #{limit} - 1, #{expires_at}, #{now}, #{now})
-                  ON CONFLICT (key) DO UPDATE SET value = #{semaphores}.value - 1, expires_at = EXCLUDED.expires_at
-                  WHERE #{semaphores}.value > 0
-                  RETURNING id
+                  #{take_slot_sql(key:, limit:, expires_at:, now:)}
                 ), job AS (
                   UPDATE #{Job.quoted_table_name} SET arguments = left(arguments, -1) || #{lock}
                   FROM semaphore WHERE #{Job.quoted_table_name}.id = #{released_job}

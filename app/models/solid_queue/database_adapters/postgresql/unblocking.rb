@@ -60,19 +60,21 @@ module SolidQueue
                 binds << ActiveRecord::Relation::QueryAttribute.new(attribute.to_s, value, model.type_for_attribute(attribute))
                 "CAST($#{binds.size} AS #{model.columns_hash[attribute.to_s].sql_type})"
               end
-              jobs, semaphores, blocked = Job.quoted_table_name, Semaphore.quoted_table_name, BlockedExecution.quoted_table_name
+              jobs, blocked = Job.quoted_table_name, BlockedExecution.quoted_table_name
               key, now = bind.(job.concurrency_key, Job, :concurrency_key), bind.(Time.current, ReadyExecution, :created_at)
               lock_key = Job::ConcurrencyControls::CONCURRENCY_LOCK_KEY
               semaphore_id = bind.(job.acquired_semaphore_id, Semaphore, :id)
               lock = "',#{connection.quote_string(lock_key.to_json)}:{\"semaphore_id\":' || semaphore.id || ',\"limit\":' || #{bind.(job.concurrency_limit, Semaphore, :value)} || '}}'"
+              limit = bind.(job.acquired_concurrency_limit || job.concurrency_limit, Semaphore, :value)
+              expires_at = bind.(job.concurrency_duration.from_now, Semaphore, :expires_at)
 
               # As the statements it replaces would
               ActiveRecord::Base.clear_query_caches_for_current_thread if connection.pool.dirties_query_cache
 
               # Prepared, which Active Record only does for a string when told it can
-              connection.select_all(<<~SQL.squish, "#{Job.name} Unblock", binds, preparable: true).rows.first
+              with_slots_locked(connection, [ job.concurrency_key ]) { connection.select_all(<<~SQL.squish, "#{Job.name} Unblock", binds, preparable: true).rows.first }
                 WITH held AS (
-                  SELECT id FROM #{semaphores} WHERE id = #{semaphore_id} AND key = #{key} AND value >= 0 FOR UPDATE
+                  #{hold_semaphore_sql(semaphore_id:, key:, now:)}
                 ), next AS (
                   SELECT id, job_id FROM #{blocked} WHERE concurrency_key = #{key} AND EXISTS (SELECT 1 FROM held)
                   ORDER BY priority ASC, job_id ASC LIMIT 1 FOR UPDATE SKIP LOCKED
@@ -84,10 +86,7 @@ module SolidQueue
                     AND right(rtrim(left(#{jobs}.arguments, -1), E' \\t\\n\\r'), 1) <> '{'
                     AND position('#{connection.quote_string(lock_key)}' in #{jobs}.arguments) = 0
                 ), semaphore AS (
-                  UPDATE #{semaphores} SET value = value + CASE WHEN EXISTS (SELECT 1 FROM successor) THEN 0 ELSE 1 END,
-                    expires_at = #{bind.(job.concurrency_duration.from_now, Semaphore, :expires_at)}
-                  WHERE id = #{semaphore_id} AND value < #{bind.(job.acquired_concurrency_limit || job.concurrency_limit, Semaphore, :value)}
-                  RETURNING id
+                  #{give_back_slot_sql(semaphore_id:, key:, limit:, expires_at:, now:, handed_over: "EXISTS (SELECT 1 FROM successor)")}
                 ), job AS (
                   UPDATE #{jobs} SET arguments = left(arguments, -1) || #{lock}
                   FROM semaphore, successor WHERE #{jobs}.id = successor.job_id

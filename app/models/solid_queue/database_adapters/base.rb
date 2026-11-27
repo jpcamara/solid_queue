@@ -31,6 +31,30 @@ module SolidQueue
         job.unblock_next_blocked_job_in_steps
       end
 
+      # Takes a concurrency slot for the job. Returns the id of the semaphore
+      # it got the slot from, or nil if none was free.
+      def take_slot(job)
+        Semaphore::Proxy.new(job).wait
+      end
+
+      # Gives the job's concurrency slot back. Returns whether it did.
+      def give_back_slot(job)
+        Semaphore::Proxy.new(job).signal
+      end
+
+      # The concurrency keys among these with a slot free, or with no
+      # semaphore yet.
+      def keys_with_free_slots(keys)
+        semaphores = Semaphore.where(key: keys).pluck(:key, :value).to_h
+        (keys - semaphores.keys) | semaphores.select { |_key, value| value > 0 }.keys
+      end
+
+      # Run by the dispatcher's concurrency maintenance: deletes the
+      # semaphores that have expired, batch_size at a time.
+      def expire_semaphores(batch_size)
+        Semaphore.expired.in_batches(of: batch_size, &:delete_all)
+      end
+
       # Makes the jobs ready, running the given block, which does it in the
       # ready executions table. The models call it for one job or for many.
       def make_ready(jobs)
