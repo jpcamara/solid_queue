@@ -30,11 +30,12 @@ module SolidQueue
         active_jobs_by_job_id = active_jobs.index_by(&:job_id)
 
         transaction do
-          database_adapter.enqueue_all(active_jobs).tap do |enqueued_jobs|
-            enqueued_jobs.each do |enqueued_job|
-              active_jobs_by_job_id[enqueued_job.active_job_id].provider_job_id = enqueued_job.id
-              active_jobs_by_job_id[enqueued_job.active_job_id].successfully_enqueued = true
-            end
+          inserted = without_discarded_on_enqueue(active_jobs)
+          next if inserted.empty?
+
+          database_adapter.enqueue_all(inserted).each do |enqueued_job|
+            active_jobs_by_job_id[enqueued_job.active_job_id].provider_job_id = enqueued_job.id
+            active_jobs_by_job_id[enqueued_job.active_job_id].successfully_enqueued = true
           end
         end
 
@@ -82,12 +83,38 @@ module SolidQueue
         DEFAULT_QUEUE_NAME = "default"
 
         def create_from_active_job(active_job)
-          create!(**attributes_from_active_job(active_job))
+          attributes = attributes_from_active_job(active_job)
+          if active_job.concurrency_max_blocked && (job = new(**attributes)).discardable_on_enqueue?
+            # Counted into its batch, as a job discarded after its insert is
+            BatchExecution.count_into_batches([ job ])
+            job
+          else
+            create!(**attributes)
+          end
         rescue ActiveRecord::ActiveRecordError => e
           enqueue_error = EnqueueError.new("#{e.class.name}: #{e.message}").tap do |error|
             error.set_backtrace e.backtrace
           end
           raise enqueue_error
+        end
+
+        # The jobs to insert, leaving out those discarded before their insert,
+        # which are counted into their batches unless one of the same Active
+        # Job is inserted. Nothing's inserted until they're all checked, so
+        # jobs of one class on one key are checked once.
+        def without_discarded_on_enqueue(active_jobs)
+          checked = {}
+          discarded = active_jobs.select(&:concurrency_max_blocked).filter_map do |active_job|
+            job = new(**attributes_from_active_job(active_job))
+            discardable = checked.fetch([ job.class_name, job.concurrency_key, job.due? ]) { |check| checked[check] = job.discardable_on_enqueue? }
+            [ active_job, job ] if discardable
+          end.to_h
+          return active_jobs if discarded.empty?
+
+          kept = active_jobs - discarded.keys
+          kept_ids = kept.map(&:job_id).to_set
+          BatchExecution.count_into_batches(discarded.values.reject { |job| kept_ids.include?(job.active_job_id) })
+          kept
         end
 
         def create_all_from_active_jobs(active_jobs)

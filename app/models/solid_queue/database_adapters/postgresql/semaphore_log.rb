@@ -122,6 +122,11 @@ module SolidQueue
             end
           end
 
+          # with_slots_locked locks the key, after the job's batch, in a statement
+          # of its own already.
+          def lock_semaphore_first(connection, job)
+          end
+
           # The key's semaphore: its newest row, unless it has expired
           def current_semaphore_sql(key, now)
             "(SELECT * FROM (SELECT semaphore_id, value, expires_at FROM #{LOG} WHERE key = #{key} ORDER BY id DESC LIMIT 1) newest WHERE expires_at > #{now})"
