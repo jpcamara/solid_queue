@@ -8,7 +8,8 @@ module SolidQueue
         # instead of an INSERT for each. A job in a batch is counted into the
         # batch and tracked by the same statement, which inserts nothing when
         # the batch has finished. A job with a concurrency limit takes its slot
-        # in it too, and is inserted blocked if there's none. One that caps its
+        # in it too, and is inserted blocked if there's none. One that discards
+        # on conflict isn't inserted without a slot, and one that caps its
         # blocked jobs is inserted blocked only while fewer than max_blocked
         # are, and isn't inserted otherwise, as if discarded after its insert.
         # Others are inserted as in Base.
@@ -24,7 +25,7 @@ module SolidQueue
           return super unless insertable_ready?(job, connection)
 
           returned = insert_ready(job, connection, values, Array(returning))
-          counted = job.concurrency_max_blocked ? returned.pop : returned
+          counted = discardable_in_statement?(job) ? returned.pop : returned
           raise Batch::AlreadyFinished, "Can't add jobs into an already finished batch" unless counted
           raise Job::ReadyOnInsert::Discarded if returned.first.nil?
 
@@ -83,9 +84,11 @@ module SolidQueue
               ctes << "semaphore AS (#{take_slot_sql(key:, limit:, expires_at:, now:, condition: inserted_if)})"
               ready_if = "WHERE EXISTS (SELECT 1 FROM semaphore)"
 
+              if job.concurrency_on_conflict.discard?
+                insertable_if = "EXISTS (SELECT 1 FROM semaphore)"
               # As block does. The key is locked before the statement starts, so
               # it counts what the last enqueue on the key committed.
-              if job.concurrency_max_blocked
+              elsif job.concurrency_max_blocked
                 max_blocked = bind.(job.concurrency_max_blocked, Semaphore, :value)
                 insertable_if = "(EXISTS (SELECT 1 FROM semaphore) OR (#{max_blocked} > 0 AND NOT EXISTS (
                   SELECT 1 FROM #{BlockedExecution.quoted_table_name} WHERE concurrency_key = #{key} OFFSET GREATEST(#{max_blocked} - 1, 0) LIMIT 1
@@ -129,9 +132,10 @@ module SolidQueue
               SQL
             end
 
-            # A capped job's statement returns a row whether or not the job was
-            # inserted, ending with whether it was counted into its batch.
-            sql = if job.concurrency_max_blocked
+            # A statement that can discard the job returns a row whether or not
+            # the job was inserted, ending with whether it was counted into its
+            # batch.
+            sql = if discardable_in_statement?(job)
               "WITH #{ctes.join(", ")} SELECT #{returned.join(", ")}, #{job.batched? ? "EXISTS (SELECT 1 FROM batch)" : "true"} FROM (SELECT) one LEFT JOIN job ON true".squish
             else
               "WITH #{ctes.join(", ")} SELECT #{returned.join(", ")} FROM job".squish
@@ -141,7 +145,7 @@ module SolidQueue
             ActiveRecord::Base.clear_query_caches_for_current_thread if connection.pool.dirties_query_cache
 
             with_slots_locked(connection, job.concurrency_limited? ? [ job.concurrency_key ] : [], batches_of: [ job ]) do
-              lock_semaphore_first(connection, job) if job.concurrency_max_blocked
+              lock_semaphore_first(connection, job) if capped?(job)
               # Not when locking the key ran a statement in the transaction first
               eligible = job.saving_in_own_transaction? && connection.open_transactions == 1 &&
                 !connection.current_transaction.materialized? && !connection.current_transaction.isolation_level &&
@@ -158,16 +162,25 @@ module SolidQueue
           # that uses INSERT ... RETURNING. Its internal_exec_query is gone on
           # Rails main.
           #
-          # Not a job with a concurrency limit that discards it on conflict, nor
-          # one that caps its blocked jobs with a limit below 1, as its key may
-          # be locked by creating its semaphore with every slot free, and it has
-          # none. Nor one whose class doesn't load, which skips its limits, nor
-          # one whose arguments the statement can't add its slot to.
+          # Not a job that caps its blocked jobs with a limit below 1, as its key
+          # may be locked by creating its semaphore with every slot free, and it
+          # has none. Nor one whose class doesn't load, which skips its limits,
+          # nor one whose arguments the statement can't add its slot to.
           def insertable_ready?(job, connection)
             !connection.preventing_writes? && connection.use_insert_returning? && connection.respond_to?(:internal_exec_query) &&
               job.due? &&
-              (!job.concurrency_limited? || (job.job_class.present? && !job.concurrency_on_conflict.discard? &&
-                (!job.concurrency_max_blocked || job.concurrency_limit >= 1) && slot_recordable_in_arguments?(job)))
+              (!job.concurrency_limited? || (job.job_class.present? &&
+                (!capped?(job) || job.concurrency_limit >= 1) && slot_recordable_in_arguments?(job)))
+          end
+
+          # A job that caps its blocked jobs and blocks on conflict, as one that
+          # discards on conflict has no blocked jobs to count
+          def capped?(job)
+            job.concurrency_max_blocked && !job.concurrency_on_conflict.discard?
+          end
+
+          def discardable_in_statement?(job)
+            job.concurrency_limited? && (job.concurrency_on_conflict.discard? || job.concurrency_max_blocked)
           end
 
           # The statement adds the slot's entry ahead of the serialized arguments'

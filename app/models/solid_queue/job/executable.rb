@@ -29,7 +29,7 @@ module SolidQueue
           with_concurrency_limits, without_concurrency_limits = jobs.partition(&:concurrency_limited?)
 
           dispatch_all_at_once(without_concurrency_limits)
-          dispatch_all_one_by_one(with_concurrency_limits)
+          database_adapter.dispatch_limited(with_concurrency_limits) { |jobs| dispatch_all_one_by_one(jobs) } if with_concurrency_limits.any?
 
           successfully_dispatched(jobs)
         end

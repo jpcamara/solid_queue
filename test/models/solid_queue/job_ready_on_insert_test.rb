@@ -61,13 +61,9 @@ class SolidQueue::JobReadyOnInsertTest < ActiveSupport::TestCase
     end
   end
 
-  test "scheduled jobs, and limited jobs that discard on conflict or whose class doesn't load, are inserted and then dispatched" do
+  test "scheduled jobs, and limited jobs whose class doesn't load, are inserted and then dispatched" do
     statements = capturing_statements { AddToBufferJob.set(wait: 1.minute).perform_later(1) }
     assert SolidQueue::Job.last.scheduled?
-    assert_no_ready_on_insert statements
-
-    statements = capturing_statements { DiscardingJob.perform_later("key") }
-    assert SolidQueue::Job.last.ready?
     assert_no_ready_on_insert statements
 
     statements = capturing_statements { SolidQueue::Job.create!(queue_name: "default", class_name: "NoSuchJob", arguments: { "arguments" => [] }, concurrency_key: "key", active_job_id: SecureRandom.uuid) }
@@ -182,6 +178,26 @@ class SolidQueue::JobReadyOnInsertTest < ActiveSupport::TestCase
     assert_equal 2, jobs.count(&:ready?)
     assert_equal threads - 2, jobs.count(&:blocked?)
     assert_equal 0, SolidQueue::Semaphore.sole.value
+  end
+
+  test "a job that discards on conflict takes its slot in the statement that inserts it, and isn't inserted without one" do
+    ready, discarded, created = nil, nil, nil
+    statements = capturing_statements do
+      ready = DiscardingJob.perform_later("key")
+      discarded = DiscardingJob.new("key").tap(&:enqueue)
+      created = SolidQueue::Job.enqueue(DiscardingJob.new("key"))
+    end
+
+    assert SolidQueue::Job.find(ready.provider_job_id).ready?
+    assert discarded.successfully_enqueued?
+    assert_nil discarded.provider_job_id
+    assert_not created.persisted?
+    assert_equal 1, SolidQueue::Job.count
+    assert_equal [ "WITH" ] * 3, verbs(statements), statements if postgresql?
+
+    batch = SolidQueue::Batch.enqueue { DiscardingJob.perform_later("key") }
+    assert_equal 1, batch.reload.total_jobs
+    assert_equal 1, SolidQueue::Job.count
   end
 
   test "a capped job that gets a slot, or is blocked, is inserted by one statement after its key is locked" do
