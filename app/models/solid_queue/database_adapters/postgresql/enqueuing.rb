@@ -121,7 +121,7 @@ module SolidQueue
             # As the INSERT it replaces would
             ActiveRecord::Base.clear_query_caches_for_current_thread if connection.pool.dirties_query_cache
 
-            with_slots_locked(connection, job.concurrency_limited? ? [ job.concurrency_key ] : []) do
+            with_slots_locked(connection, job.concurrency_limited? ? [ job.concurrency_key ] : [], batches_of: [ job ]) do
               # Not when locking the key ran a statement in the transaction first
               eligible = job.saving_in_own_transaction? && connection.open_transactions == 1 &&
                 !connection.current_transaction.materialized? && !connection.current_transaction.isolation_level &&

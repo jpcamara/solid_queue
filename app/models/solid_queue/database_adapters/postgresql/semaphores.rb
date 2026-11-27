@@ -10,8 +10,10 @@ module SolidQueue
       module Semaphores
         private
           # Runs the block, which takes or gives back slots of the keys' semaphores
-          # in its statement. The rows that statement locks are all it needs.
-          def with_slots_locked(connection, keys)
+          # in its statement. The rows that statement locks are all it needs, and
+          # it locks the batches of the jobs given first, as it takes a slot only
+          # once the job is counted into its batch.
+          def with_slots_locked(connection, keys, batches_of: [])
             yield
           end
 
