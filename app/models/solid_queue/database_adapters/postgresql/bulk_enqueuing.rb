@@ -89,9 +89,10 @@ module SolidQueue
           end
 
           # Single enqueues and stock dispatch count a job into its batch before
-          # taking its slot, so the set locks its batches first too.
-          def lock_batches(connection, active_jobs)
-            batch_ids = Batch.migrated? ? active_jobs.filter_map(&:batch_id).uniq.sort : []
+          # taking its slot, so the set locks its batches first too. Takes jobs
+          # or Active Jobs.
+          def lock_batches(connection, jobs)
+            batch_ids = Batch.migrated? ? jobs.filter_map(&:batch_id).uniq.sort : []
             return if batch_ids.empty?
 
             connection.exec_query(<<~SQL.squish, "#{Batch.name} Lock All", [ json_bind(batch_ids) ])

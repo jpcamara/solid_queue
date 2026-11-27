@@ -82,11 +82,14 @@ module SolidQueue
 
         private
           # Runs the block with the keys' advisory locks taken, in byte order, in
-          # a transaction, which the locks are held until the end of.
-          def with_slots_locked(connection, keys)
+          # a transaction, which the locks are held until the end of. The
+          # batches of the jobs given are locked first, as other enqueues count
+          # a job into its batch before taking its slot.
+          def with_slots_locked(connection, keys, batches_of: [])
             return yield if keys.empty?
 
             connection.transaction do
+              lock_batches(connection, batches_of)
               # The locks are taken in a subquery, so their void results aren't returned
               isolation = connection.select_values(<<~SQL.squish, "#{Semaphore.name} Lock", [ json_bind(keys.uniq) ]).first
                 SELECT current_setting('transaction_isolation') FROM (

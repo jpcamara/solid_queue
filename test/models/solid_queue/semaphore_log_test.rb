@@ -195,6 +195,32 @@ class SolidQueue::SemaphoreLogTest < ActiveSupport::TestCase
     [ holder, waiter ].compact.each { |thread| thread.join(5) }
   end
 
+  test "a limited job enqueued into a batch waits for the batch before locking its key, as other enqueues do" do
+    batch = SolidQueue::Batch.create!
+    locked = Concurrent::Event.new
+    done = Concurrent::Event.new
+
+    holder = Thread.new do
+      SolidQueue::Record.transaction do
+        SolidQueue::Batch.lock("FOR NO KEY UPDATE").find(batch.id)
+        locked.set
+        done.wait(30)
+      end
+    end
+    locked.wait(5)
+
+    enqueuer = Thread.new { SolidQueue::Batch.wrap_in_batch_context(batch.id) { enqueue(LimitedToOneJob, "a") } }
+    wait_for { lock_waiters > 0 }
+    assert enqueuer.alive?, "the enqueue didn't wait for the batch"
+    assert_equal 0, advisory_locks_held, "the enqueue locked its key before its batch"
+
+    done.set
+    assert enqueuer.value.ready?
+  ensure
+    done&.set
+    [ holder, enqueuer ].compact.each { |thread| thread.join(5) }
+  end
+
   test "concurrent enqueues and hand-overs on one key hand out exactly the limit" do
     key = "semaphore log three/k"
     16.times.map { Thread.new { SolidQueue::Record.connection_pool.with_connection { 25.times { LimitedToThreeJob.perform_later("k") } } } }.each(&:join)
@@ -260,6 +286,14 @@ class SolidQueue::SemaphoreLogTest < ActiveSupport::TestCase
     def insert_row(id:, key:, value:, expires_at: 3.minutes.from_now)
       connection.exec_query("INSERT INTO #{LOG} (id, key, semaphore_id, value, expires_at, created_at) VALUES ($1, $2, $1, $3, $4, $5)",
         "insert", [ id, one_key_of(key), value, expires_at.utc, Time.now.utc ])
+    end
+
+    def lock_waiters
+      connection.select_value("SELECT count(*) FROM pg_locks WHERE NOT granted")
+    end
+
+    def advisory_locks_held
+      connection.select_value("SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND granted")
     end
 
     def advisory_lock_waiters
